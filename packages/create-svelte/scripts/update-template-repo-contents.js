@@ -1,5 +1,5 @@
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import { create } from '../index.js';
 
 const repo = process.argv[2];
@@ -20,7 +20,8 @@ await create(repo, {
 	types: 'checkjs',
 	prettier: true,
 	playwright: false,
-	vitest: false
+	vitest: false,
+	svelte5: false
 });
 
 // Remove the Sverdle from the template because it doesn't work within Stackblitz (cookies not set)

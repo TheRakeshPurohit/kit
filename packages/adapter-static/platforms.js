@@ -1,10 +1,10 @@
-import fs from 'fs';
+import fs from 'node:fs';
 
 /**
  * @typedef {{
  *   name: string;
  *   test: () => boolean;
- *   defaults: import('./index').AdapterOptions;
+ *   defaults: import('./index.js').AdapterOptions;
  *   done: (builder: import('@sveltejs/kit').Builder) => void;
  * }}
  * Platform */

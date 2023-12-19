@@ -1,4 +1,5 @@
 import { GENERATED_COMMENT } from '../constants.js';
+import { dedent } from './sync/utils.js';
 import { runtime_base } from './utils.js';
 
 /**
@@ -50,34 +51,51 @@ export function create_dynamic_module(type, dev_values) {
 export function create_static_types(id, env) {
 	const declarations = Object.keys(env[id])
 		.filter((k) => valid_identifier.test(k))
-		.map((k) => `\texport const ${k}: string;`)
-		.join('\n');
+		.map((k) => `export const ${k}: string;`);
 
-	return `declare module '$env/static/${id}' {\n${declarations}\n}`;
+	return dedent`
+		declare module '$env/static/${id}' {
+			${declarations.join('\n')}
+		}
+	`;
 }
 
 /**
  * @param {EnvType} id
  * @param {import('types').Env} env
- * @param {string} prefix
+ * @param {{
+ * 	public_prefix: string;
+ * 	private_prefix: string;
+ * }} prefixes
  * @returns {string}
  */
-export function create_dynamic_types(id, env, prefix) {
+export function create_dynamic_types(id, env, { public_prefix, private_prefix }) {
 	const properties = Object.keys(env[id])
 		.filter((k) => valid_identifier.test(k))
-		.map((k) => `\t\t${k}: string;`);
+		.map((k) => `${k}: string;`);
 
-	const prefixed = `[key: \`${prefix}\${string}\`]`;
+	const public_prefixed = `[key: \`${public_prefix}\${string}\`]`;
+	const private_prefixed = `[key: \`${private_prefix}\${string}\`]`;
 
 	if (id === 'private') {
-		properties.push(`\t\t${prefixed}: undefined;`);
-		properties.push(`\t\t[key: string]: string | undefined;`);
+		if (public_prefix) {
+			properties.push(`${public_prefixed}: undefined;`);
+		}
+		properties.push(`${private_prefixed}: string | undefined;`);
 	} else {
-		properties.push(`\t\t${prefixed}: string | undefined;`);
+		if (private_prefix) {
+			properties.push(`${private_prefixed}: undefined;`);
+		}
+		properties.push(`${public_prefixed}: string | undefined;`);
 	}
 
-	const declaration = `export const env: {\n${properties.join('\n')}\n\t}`;
-	return `declare module '$env/dynamic/${id}' {\n\t${declaration}\n}`;
+	return dedent`
+		declare module '$env/dynamic/${id}' {
+			export const env: {
+				${properties.join('\n')}
+			}
+		}
+	`;
 }
 
 export const reserved = new Set([

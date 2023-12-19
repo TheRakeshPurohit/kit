@@ -1,9 +1,8 @@
-import { read_samples } from '../utils.js';
-import { test } from 'uvu';
-import * as assert from 'uvu/assert';
+import { assert, test } from 'vitest';
 import { migrate_scripts } from './index.js';
+import { read_samples } from '../../../utils.js';
 
-for (const sample of read_samples(import.meta.url)) {
+for (const sample of read_samples(new URL('./samples.md', import.meta.url))) {
 	test(sample.description, () => {
 		const actual = migrate_scripts(
 			sample.before,
@@ -13,5 +12,3 @@ for (const sample of read_samples(import.meta.url)) {
 		assert.equal(actual.main, sample.after);
 	});
 }
-
-test.run();

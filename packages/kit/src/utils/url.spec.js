@@ -1,5 +1,4 @@
-import * as assert from 'uvu/assert';
-import { describe } from './unit_test.js';
+import { assert, describe } from 'vitest';
 import { resolve, normalize_path, make_trackable, disable_search } from './url.js';
 
 describe('resolve', (test) => {
@@ -54,6 +53,18 @@ describe('resolve', (test) => {
 	test('resolves a fragment link', () => {
 		assert.equal(resolve('/a/b/c', '#foo'), '/a/b/c#foo');
 	});
+
+	test('resolves data: urls', () => {
+		assert.equal(resolve('/a/b/c', 'data:text/plain,hello'), 'data:text/plain,hello');
+	});
+
+	test('resolves empty string', () => {
+		assert.equal(resolve('/a/b/c', ''), '/a/b/c');
+	});
+
+	test('resolves .', () => {
+		assert.equal(resolve('/a/b/c', '.'), '/a/b/');
+	});
 });
 
 describe('normalize_path', (test) => {
@@ -90,10 +101,13 @@ describe('normalize_path', (test) => {
 describe('make_trackable', (test) => {
 	test('makes URL properties trackable', () => {
 		let tracked = false;
-
-		const url = make_trackable(new URL('https://kit.svelte.dev/docs'), () => {
-			tracked = true;
-		});
+		const url = make_trackable(
+			new URL('https://kit.svelte.dev/docs'),
+			() => {
+				tracked = true;
+			},
+			() => {}
+		);
 
 		url.origin;
 		assert.ok(!tracked);
@@ -103,12 +117,45 @@ describe('make_trackable', (test) => {
 	});
 
 	test('throws an error when its hash property is accessed', () => {
-		const url = make_trackable(new URL('https://kit.svelte.dev/docs'), () => {});
+		const url = make_trackable(
+			new URL('https://kit.svelte.dev/docs'),
+			() => {},
+			() => {}
+		);
 
 		assert.throws(
 			() => url.hash,
-			'url.hash is inaccessible from load. Consider accessing hash from the page store within the script tag of your component.'
+			/Cannot access event.url.hash. Consider using `\$page.url.hash` inside a component instead/
 		);
+	});
+
+	test('track each search param separately if accessed directly', () => {
+		let tracked = false;
+		const tracked_search_params = new Set();
+		const url = make_trackable(
+			new URL('https://kit.svelte.dev/docs'),
+			() => {
+				tracked = true;
+			},
+			(search_param) => {
+				tracked_search_params.add(search_param);
+			}
+		);
+
+		url.searchParams.get('test');
+		assert.ok(!tracked);
+		assert.ok(tracked_search_params.has('test'));
+
+		url.searchParams.getAll('test-getall');
+		assert.ok(!tracked);
+		assert.ok(tracked_search_params.has('test-getall'));
+
+		url.searchParams.has('test-has');
+		assert.ok(!tracked);
+		assert.ok(tracked_search_params.has('test-has'));
+
+		url.searchParams.entries();
+		assert.ok(tracked);
 	});
 });
 
@@ -122,7 +169,7 @@ describe('disable_search', (test) => {
 		props.forEach((prop) => {
 			assert.throws(
 				() => url[prop],
-				'Cannot access url.search on a page with prerendering enabled'
+				`Cannot access url.${prop} on a page with prerendering enabled`
 			);
 		});
 	});

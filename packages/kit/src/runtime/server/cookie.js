@@ -1,5 +1,5 @@
 import { parse, serialize } from 'cookie';
-import { normalize_path } from '../../utils/url.js';
+import { add_data_suffix, normalize_path, resolve } from '../../utils/url.js';
 
 /**
  * Tracks all cookies set during dev mode so we can emit warnings
@@ -14,6 +14,14 @@ const cookie_paths = {};
  */
 const MAX_COOKIE_SIZE = 4129;
 
+// TODO 3.0 remove this check
+/** @param {import('./page/types.js').Cookie['options']} options */
+function validate_options(options) {
+	if (options?.path === undefined) {
+		throw new Error('You must specify a `path` when setting, deleting or serializing cookies');
+	}
+}
+
 /**
  * @param {Request} request
  * @param {URL} url
@@ -24,30 +32,8 @@ export function get_cookies(request, url, trailing_slash) {
 	const initial_cookies = parse(header, { decode: (value) => value });
 
 	const normalized_url = normalize_path(url.pathname, trailing_slash);
-	// Emulate browser-behavior: if the cookie is set at '/foo/bar', its path is '/foo'
-	const default_path = normalized_url.split('/').slice(0, -1).join('/') || '/';
 
-	if (__SVELTEKIT_DEV__) {
-		// TODO this could theoretically be wrong if the cookie was set unencoded?
-		const initial_decoded_cookies = parse(header, { decode: decodeURIComponent });
-		// Remove all cookies that no longer exist according to the request
-		for (const name of Object.keys(cookie_paths)) {
-			cookie_paths[name] = new Set(
-				[...cookie_paths[name]].filter(
-					(path) => !path_matches(normalized_url, path) || name in initial_decoded_cookies
-				)
-			);
-		}
-		// Add all new cookies we might not have seen before
-		for (const name in initial_decoded_cookies) {
-			cookie_paths[name] = cookie_paths[name] ?? new Set();
-			if (![...cookie_paths[name]].some((path) => path_matches(normalized_url, path))) {
-				cookie_paths[name].add(default_path);
-			}
-		}
-	}
-
-	/** @type {Record<string, import('./page/types').Cookie>} */
+	/** @type {Record<string, import('./page/types.js').Cookie>} */
 	const new_cookies = {};
 
 	/** @type {import('cookie').CookieSerializeOptions} */
@@ -57,11 +43,11 @@ export function get_cookies(request, url, trailing_slash) {
 		secure: url.hostname === 'localhost' && url.protocol === 'http:' ? false : true
 	};
 
-	/** @type {import('types').Cookies} */
+	/** @type {import('@sveltejs/kit').Cookies} */
 	const cookies = {
 		// The JSDoc param annotations appearing below for get, set and delete
 		// are necessary to expose the `cookie` library types to
-		// typescript users. `@type {import('types').Cookies}` above is not
+		// typescript users. `@type {import('@sveltejs/kit').Cookies}` above is not
 		// sufficient to do so.
 
 		/**
@@ -82,84 +68,79 @@ export function get_cookies(request, url, trailing_slash) {
 			const req_cookies = parse(header, { decode: decoder });
 			const cookie = req_cookies[name]; // the decoded string or undefined
 
-			if (!__SVELTEKIT_DEV__ || cookie) {
-				return cookie;
+			// in development, if the cookie was set during this session with `cookies.set`,
+			// but at a different path, warn the user. (ignore cookies from request headers,
+			// since we don't know which path they were set at)
+			if (__SVELTEKIT_DEV__ && !cookie) {
+				const paths = Array.from(cookie_paths[name] ?? []).filter((path) => {
+					// we only care about paths that are _more_ specific than the current path
+					return path_matches(path, url.pathname) && path !== url.pathname;
+				});
+
+				if (paths.length > 0) {
+					console.warn(
+						// prettier-ignore
+						`'${name}' cookie does not exist for ${url.pathname}, but was previously set at ${conjoin([...paths])}. Did you mean to set its 'path' to '/' instead?`
+					);
+				}
 			}
 
-			const paths = new Set([...(cookie_paths[name] ?? [])]);
-			if (c) {
-				paths.add(c.options.path ?? default_path);
+			return cookie;
+		},
+
+		/**
+		 * @param {import('cookie').CookieParseOptions} opts
+		 */
+		getAll(opts) {
+			const decoder = opts?.decode || decodeURIComponent;
+			const cookies = parse(header, { decode: decoder });
+
+			for (const c of Object.values(new_cookies)) {
+				if (
+					domain_matches(url.hostname, c.options.domain) &&
+					path_matches(url.pathname, c.options.path)
+				) {
+					cookies[c.name] = c.value;
+				}
 			}
-			if (paths.size > 0) {
-				console.warn(
-					// prettier-ignore
-					`Cookie with name '${name}' was not found at path '${url.pathname}', but a cookie with that name exists at these paths: '${[...paths].join("', '")}'. Did you mean to set its 'path' to '/' instead?`
-				);
-			}
+
+			return Object.entries(cookies).map(([name, value]) => ({ name, value }));
 		},
 
 		/**
 		 * @param {string} name
 		 * @param {string} value
-		 * @param {import('cookie').CookieSerializeOptions} opts
+		 * @param {import('./page/types.js').Cookie['options']} options
 		 */
-		set(name, value, opts = {}) {
-			let path = opts.path ?? default_path;
-
-			new_cookies[name] = {
-				name,
-				value,
-				options: {
-					...defaults,
-					...opts,
-					path
-				}
-			};
-
-			if (__SVELTEKIT_DEV__) {
-				const serialized = serialize(name, value, new_cookies[name].options);
-				if (new TextEncoder().encode(serialized).byteLength > MAX_COOKIE_SIZE) {
-					throw new Error(`Cookie "${name}" is too large, and will be discarded by the browser`);
-				}
-
-				cookie_paths[name] = cookie_paths[name] ?? new Set();
-				if (!value) {
-					if (!cookie_paths[name].has(path) && cookie_paths[name].size > 0) {
-						const paths = `'${Array.from(cookie_paths[name]).join("', '")}'`;
-						console.warn(
-							`Trying to delete cookie '${name}' at path '${path}', but a cookie with that name only exists at these paths: ${paths}.`
-						);
-					}
-					cookie_paths[name].delete(path);
-				} else {
-					// We could also emit a warning here if the cookie already exists at a different path,
-					// but that's more likely a false positive because it's valid to set the same name at different paths
-					cookie_paths[name].add(path);
-				}
-			}
+		set(name, value, options) {
+			validate_options(options);
+			set_internal(name, value, { ...defaults, ...options });
 		},
 
 		/**
 		 * @param {string} name
-		 * @param {import('cookie').CookieSerializeOptions} opts
+		 *  @param {import('./page/types.js').Cookie['options']} options
 		 */
-		delete(name, opts = {}) {
-			cookies.set(name, '', {
-				...opts,
-				maxAge: 0
-			});
+		delete(name, options) {
+			validate_options(options);
+			cookies.set(name, '', { ...options, maxAge: 0 });
 		},
 
 		/**
 		 * @param {string} name
 		 * @param {string} value
-		 * @param {import('cookie').CookieSerializeOptions} opts
+		 *  @param {import('./page/types.js').Cookie['options']} options
 		 */
-		serialize(name, value, opts) {
-			return serialize(name, value, {
-				...defaults,
-				...opts
-			});
+		serialize(name, value, options) {
+			validate_options(options);
+
+			let path = options.path;
+
+			if (!options.domain || options.domain === url.hostname) {
+				path = resolve(normalized_url, path);
+			}
+
+			return serialize(name, value, { ...defaults, ...options, path });
 		}
 	};
 
@@ -197,7 +178,37 @@ export function get_cookies(request, url, trailing_slash) {
 			.join('; ');
 	}
 
-	return { cookies, new_cookies, get_cookie_header };
+	/**
+	 * @param {string} name
+	 * @param {string} value
+	 * @param {import('./page/types.js').Cookie['options']} options
+	 */
+	function set_internal(name, value, options) {
+		let path = options.path;
+
+		if (!options.domain || options.domain === url.hostname) {
+			path = resolve(normalized_url, path);
+		}
+
+		new_cookies[name] = { name, value, options: { ...options, path } };
+
+		if (__SVELTEKIT_DEV__) {
+			const serialized = serialize(name, value, new_cookies[name].options);
+			if (new TextEncoder().encode(serialized).byteLength > MAX_COOKIE_SIZE) {
+				throw new Error(`Cookie "${name}" is too large, and will be discarded by the browser`);
+			}
+
+			cookie_paths[name] ??= new Set();
+
+			if (!value) {
+				cookie_paths[name].delete(path);
+			} else {
+				cookie_paths[name].add(path);
+			}
+		}
+	}
+
+	return { cookies, new_cookies, get_cookie_header, set_internal };
 }
 
 /**
@@ -228,11 +239,27 @@ export function path_matches(path, constraint) {
 
 /**
  * @param {Headers} headers
- * @param {import('./page/types').Cookie[]} cookies
+ * @param {import('./page/types.js').Cookie[]} cookies
  */
 export function add_cookies_to_headers(headers, cookies) {
 	for (const new_cookie of cookies) {
 		const { name, value, options } = new_cookie;
 		headers.append('set-cookie', serialize(name, value, options));
+
+		// special case — for routes ending with .html, the route data lives in a sibling
+		// `.html__data.json` file rather than a child `/__data.json` file, which means
+		// we need to duplicate the cookie
+		if (options.path.endsWith('.html')) {
+			const path = add_data_suffix(options.path);
+			headers.append('set-cookie', serialize(name, value, { ...options, path }));
+		}
 	}
+}
+
+/**
+ * @param {string[]} array
+ */
+function conjoin(array) {
+	if (array.length <= 2) return array.join(' and ');
+	return `${array.slice(0, -1).join(', ')} and ${array.at(-1)}`;
 }

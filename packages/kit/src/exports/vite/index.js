@@ -5,7 +5,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import colors from 'kleur';
 import * as vite from 'vite';
 
-import { mkdirp, posixify, read, resolve_entry, rimraf } from '../../utils/filesystem.js';
+import { copy, mkdirp, posixify, read, resolve_entry, rimraf } from '../../utils/filesystem.js';
 import { create_static_module, create_dynamic_module } from '../../core/env.js';
 import * as sync from '../../core/sync/sync.js';
 import { create_assets } from '../../core/sync/create_manifest_data/index.js';
@@ -18,18 +18,26 @@ import { assets_base, find_deps } from './build/utils.js';
 import { dev } from './dev/index.js';
 import { is_illegal, module_guard, normalize_id } from './graph_analysis/index.js';
 import { preview } from './preview/index.js';
-import { get_config_aliases, get_env } from './utils.js';
+import { get_config_aliases, get_env, strip_virtual_prefix } from './utils.js';
 import { write_client_manifest } from '../../core/sync/write_client_manifest.js';
 import prerender from '../../core/postbuild/prerender.js';
 import analyse from '../../core/postbuild/analyse.js';
 import { s } from '../../utils/misc.js';
 import { hash } from '../../runtime/hash.js';
-
-export { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+import { dedent, isSvelte5Plus } from '../../core/sync/utils.js';
+import {
+	env_dynamic_private,
+	env_dynamic_public,
+	env_static_private,
+	env_static_public,
+	service_worker,
+	sveltekit_environment,
+	sveltekit_paths
+} from './module_ids.js';
 
 const cwd = process.cwd();
 
-/** @type {import('./types').EnforcedConfig} */
+/** @type {import('./types.js').EnforcedConfig} */
 const enforced_config = {
 	appType: true,
 	base: true,
@@ -71,7 +79,7 @@ const options_regex = /(export\s+const\s+(prerender|csr|ssr|trailingSlash))\s*=/
 /** @type {Set<string>} */
 const warned = new Set();
 
-/** @type {import('@sveltejs/vite-plugin-svelte').PreprocessorGroup} */
+/** @type {import('svelte/compiler').PreprocessorGroup} */
 const warning_preprocessor = {
 	script: ({ content, filename }) => {
 		if (!filename) return;
@@ -100,7 +108,7 @@ const warning_preprocessor = {
 		if (basename.startsWith('+layout.') && !content.includes('<slot')) {
 			const message =
 				`\n${colors.bold().red(path.relative('.', filename))}\n` +
-				`\`<slot />\` missing — inner content will not be rendered`;
+				'`<slot />` missing — inner content will not be rendered';
 
 			if (!warned.has(message)) {
 				console.log(message);
@@ -110,7 +118,10 @@ const warning_preprocessor = {
 	}
 };
 
-/** @return {Promise<import('vite').Plugin[]>} */
+/**
+ * Returns the SvelteKit Vite plugins.
+ * @returns {Promise<import('vite').Plugin[]>}
+ */
 export async function sveltekit() {
 	const svelte_config = await load_config();
 
@@ -132,7 +143,7 @@ export async function sveltekit() {
 		onwarn: svelte_config.onwarn,
 		compilerOptions: {
 			// @ts-expect-error SvelteKit requires hydratable true by default
-			hydratable: true,
+			hydratable: isSvelte5Plus() ? undefined : true,
 			...svelte_config.compilerOptions
 		},
 		...svelte_config.vitePlugin
@@ -187,6 +198,9 @@ function kit({ svelte_config }) {
 
 	const service_worker_entry_file = resolve_entry(kit.files.serviceWorker);
 
+	const sourcemapIgnoreList = /** @param {string} relative_path */ (relative_path) =>
+		relative_path.includes('node_modules') || relative_path.includes(kit.outDir);
+
 	/** @type {import('vite').Plugin} */
 	const plugin_setup = {
 		name: 'vite-plugin-sveltekit-setup',
@@ -230,16 +244,17 @@ function kit({ svelte_config }) {
 				},
 				root: cwd,
 				server: {
+					cors: { preflightContinue: true },
 					fs: {
 						allow: [...allow]
 					},
+					sourcemapIgnoreList,
 					watch: {
 						ignored: [
 							// Ignore all siblings of config.kit.outDir/generated
 							`${posixify(kit.outDir)}/!(generated)`
 						]
-					},
-					cors: { preflightContinue: true }
+					}
 				},
 				preview: {
 					cors: { preflightContinue: true }
@@ -251,6 +266,25 @@ function kit({ svelte_config }) {
 						// this does not affect app code, just handling of imported libraries that use $app or $env
 						'$app',
 						'$env'
+					]
+				},
+				ssr: {
+					noExternal: [
+						// This ensures that esm-env is inlined into the server output with the
+						// export conditions resolved correctly through Vite. This prevents adapters
+						// that bundle later on from resolving the export conditions incorrectly
+						// and for example include browser-only code in the server output
+						// because they for example use esbuild.build with `platform: 'browser'`
+						'esm-env',
+						// We need this for two reasons:
+						// 1. Without this, `@sveltejs/kit` imports are kept as-is in the server output,
+						//    and that causes modules and therefore classes like `Redirect` to be imported twice
+						//    under different IDs, which breaks a bunch of stuff because of failing instanceof checks.
+						// 2. Vitest bypasses Vite when loading external modules, so we bundle
+						//    when it is detected to keep our virtual modules working.
+						//    See https://github.com/sveltejs/kit/pull/9172
+						//    and https://vitest.dev/config/#deps-registernodeloader
+						'@sveltejs/kit'
 					]
 				}
 			};
@@ -267,19 +301,6 @@ function kit({ svelte_config }) {
 					__SVELTEKIT_EMBEDDED__: kit.embedded ? 'true' : 'false'
 				};
 
-				new_config.ssr = {
-					noExternal: [
-						// TODO document why this is necessary
-						'@sveltejs/kit',
-						// This ensures that esm-env is inlined into the server output with the
-						// export conditions resolved correctly through Vite. This prevents adapters
-						// that bundle later on to resolve the export conditions incorrectly
-						// and for example include browser-only code in the server output
-						// because they for example use esbuild.build with `platform: 'browser'`
-						'esm-env'
-					]
-				};
-
 				if (!secondary_build_started) {
 					manifest_data = (await sync.all(svelte_config, config_env.mode)).manifest_data;
 				}
@@ -290,13 +311,12 @@ function kit({ svelte_config }) {
 					__SVELTEKIT_EMBEDDED__: kit.embedded ? 'true' : 'false'
 				};
 
-				new_config.ssr = {
-					// Without this, Vite will treat `@sveltejs/kit` as noExternal if it's
-					// a linked dependency, and that causes modules to be imported twice
-					// under different IDs, which breaks a bunch of stuff
-					// https://github.com/vitejs/vite/pull/9296
-					external: ['@sveltejs/kit', 'cookie', 'set-cookie-parser']
-				};
+				// These Kit dependencies are packaged as CommonJS, which means they must always be externalized.
+				// Without this, the tests will still pass but `pnpm dev` will fail in projects that link `@sveltejs/kit`.
+				/** @type {NonNullable<import('vite').UserConfig['ssr']>} */ (new_config.ssr).external = [
+					'cookie',
+					'set-cookie-parser'
+				];
 			}
 
 			warn_overridden_config(config, new_config);
@@ -309,10 +329,6 @@ function kit({ svelte_config }) {
 		 */
 		configResolved(config) {
 			vite_config = config;
-
-			// This is a hack to prevent Vite from nuking useful logs,
-			// pending https://github.com/vitejs/vite/issues/9378
-			config.logger.warn('');
 		}
 	};
 
@@ -323,13 +339,16 @@ function kit({ svelte_config }) {
 		async resolveId(id) {
 			// treat $env/static/[public|private] as virtual
 			if (id.startsWith('$env/') || id.startsWith('__sveltekit/') || id === '$service-worker') {
-				return `\0${id}`;
+				return `\0virtual:${id}`;
 			}
 		},
 
 		async load(id, options) {
 			const browser = !options?.ssr;
-			const global = `__sveltekit_${version_hash}`;
+
+			const global = is_build
+				? `globalThis.__sveltekit_${version_hash}`
+				: 'globalThis.__sveltekit_dev';
 
 			if (options?.ssr === false && process.env.TEST !== 'true') {
 				const normalized_cwd = vite.normalizePath(cwd);
@@ -342,59 +361,89 @@ function kit({ svelte_config }) {
 					})
 				) {
 					const relative = normalize_id(id, normalized_lib, normalized_cwd);
-					throw new Error(`Cannot import ${relative} into client-side code`);
+					throw new Error(`Cannot import ${strip_virtual_prefix(relative)} into client-side code`);
 				}
 			}
 
 			switch (id) {
-				case '\0$env/static/private':
+				case env_static_private:
 					return create_static_module('$env/static/private', env.private);
-				case '\0$env/static/public':
+
+				case env_static_public:
 					return create_static_module('$env/static/public', env.public);
-				case '\0$env/dynamic/private':
+
+				case env_dynamic_private:
 					return create_dynamic_module(
 						'private',
 						vite_config_env.command === 'serve' ? env.private : undefined
 					);
-				case '\0$env/dynamic/public':
+
+				case env_dynamic_public:
 					// populate `$env/dynamic/public` from `window`
 					if (browser) {
-						return `export const env = ${global}.env;`;
+						return `export const env = ${global}.env ?? (await import(/* @vite-ignore */ ${global}.base + '/' + '${kit.appDir}/env.js')).env;`;
 					}
 
 					return create_dynamic_module(
 						'public',
 						vite_config_env.command === 'serve' ? env.public : undefined
 					);
-				case '\0$service-worker':
+
+				case service_worker:
 					return create_service_worker_module(svelte_config);
 
 				// for internal use only. it's published as $app/paths externally
 				// we use this alias so that we won't collide with user aliases
-				case '\0__sveltekit/paths':
+				case sveltekit_paths: {
 					const { assets, base } = svelte_config.kit.paths;
 
+					// use the values defined in `global`, but fall back to hard-coded values
+					// for the sake of things like Vitest which may import this module
+					// outside the context of a page
 					if (browser) {
-						return `export const base = ${s(base)};
-export const assets = ${global}.assets;`;
+						return dedent`
+							export const base = ${global}?.base ?? ${s(base)};
+							export const assets = ${global}?.assets ?? ${assets ? s(assets) : 'base'};
+						`;
 					}
 
-					return `export const base = ${s(base)};
-export let assets = ${assets ? s(assets) : 'base'};
+					return dedent`
+						export let base = ${s(base)};
+						export let assets = ${assets ? s(assets) : 'base'};
 
-/** @param {string} path */
-export function set_assets(path) {
-	assets = path;
-}`;
+						export const relative = ${svelte_config.kit.paths.relative};
 
-				case '\0__sveltekit/environment':
+						const initial = { base, assets };
+
+						export function override(paths) {
+							base = paths.base;
+							assets = paths.assets;
+						}
+
+						export function reset() {
+							base = initial.base;
+							assets = initial.assets;
+						}
+
+						/** @param {string} path */
+						export function set_assets(path) {
+							assets = initial.assets = path;
+						}
+					`;
+				}
+
+				case sveltekit_environment: {
 					const { version } = svelte_config.kit;
-					return `export const version = ${s(version.name)};
-export let building = false;
 
-export function set_building() {
-	building = true;
-}`;
+					return dedent`
+						export const version = ${s(version.name)};
+						export let building = false;
+
+						export function set_building() {
+							building = true;
+						}
+					`;
+				}
 			}
 		}
 	};
@@ -485,54 +534,48 @@ export function set_building() {
 					input['entry/start'] = `${runtime_directory}/client/start.js`;
 					input['entry/app'] = `${kit.outDir}/generated/client-optimized/app.js`;
 
-					/**
-					 * @param {string | undefined} file
-					 */
-					function add_input(file) {
-						if (!file) return;
-
-						const resolved = path.resolve(file);
-						const relative = decodeURIComponent(path.relative(kit.files.routes, resolved));
-
-						const name = relative.startsWith('..')
-							? path.basename(file).replace(/^\+/, '')
-							: relative.replace(/(\\|\/)\+/g, '-').replace(/[\\/]/g, '-');
-
-						input[`entry/${name}`] = resolved;
-					}
-
-					for (const node of manifest_data.nodes) {
-						add_input(node.component);
-						add_input(node.universal);
-					}
+					manifest_data.nodes.forEach((node, i) => {
+						if (node.component || node.universal) {
+							input[`nodes/${i}`] = `${kit.outDir}/generated/client-optimized/nodes/${i}.js`;
+						}
+					});
 				}
 
+				// see the kit.output.preloadStrategy option for details on why we have multiple options here
+				const ext = kit.output.preloadStrategy === 'preload-mjs' ? 'mjs' : 'js';
+
+				// We could always use a relative asset base path here, but it's better for performance not to.
+				// E.g. Vite generates `new URL('/asset.png', import.meta).href` for a relative path vs just '/asset.png'.
+				// That's larger and takes longer to run and also causes an HTML diff between SSR and client
+				// causing us to do a more expensive hydration check.
+				const client_base =
+					kit.paths.relative !== false || kit.paths.assets ? './' : kit.paths.base || '/';
+
 				new_config = {
-					base: ssr ? assets_base(kit) : './',
+					base: ssr ? assets_base(kit) : client_base,
 					build: {
+						copyPublicDir: !ssr,
 						cssCodeSplit: true,
+						cssMinify: initial_config.build?.minify == null ? true : !!initial_config.build.minify,
+						// don't use the default name to avoid collisions with 'static/manifest.json'
+						manifest: '.vite/manifest.json', // TODO: remove this after bumping peer dep to vite 5
 						outDir: `${out}/${ssr ? 'server' : 'client'}`,
 						rollupOptions: {
 							input,
 							output: {
 								format: 'esm',
-								// we use .mjs for client-side modules, because this signals to Chrome (when it
-								// reads the <link rel="preload">) that it should parse the file as a module
-								// rather than as a script, preventing a double parse. Ideally we'd just use
-								// modulepreload, but Safari prevents that
-								entryFileNames: ssr ? '[name].js' : `${prefix}/[name].[hash].mjs`,
-								chunkFileNames: ssr ? 'chunks/[name].js' : `${prefix}/chunks/[name].[hash].mjs`,
+								entryFileNames: ssr ? '[name].js' : `${prefix}/[name].[hash].${ext}`,
+								chunkFileNames: ssr ? 'chunks/[name].js' : `${prefix}/chunks/[name].[hash].${ext}`,
 								assetFileNames: `${prefix}/assets/[name].[hash][extname]`,
-								hoistTransitiveImports: false
+								hoistTransitiveImports: false,
+								sourcemapIgnoreList
 							},
 							preserveEntrySignatures: 'strict'
 						},
 						ssrEmitAssets: true,
-						target: ssr ? 'node16.14' : undefined,
-						// don't use the default name to avoid collisions with 'static/manifest.json'
-						manifest: 'vite-manifest.json'
+						target: ssr ? 'node18.13' : 'es2022'
 					},
-					publicDir: ssr ? false : kit.files.assets,
+					publicDir: kit.files.assets,
 					worker: {
 						rollupOptions: {
 							output: {
@@ -625,7 +668,7 @@ export function set_building() {
 					app_dir: kit.appDir,
 					app_path: `${kit.paths.base.slice(1)}${kit.paths.base ? '/' : ''}${kit.appDir}`,
 					manifest_data,
-					service_worker: !!service_worker_entry_file ? 'service-worker.js' : null, // TODO make file configurable?
+					service_worker: service_worker_entry_file ? 'service-worker.js' : null, // TODO make file configurable?
 					client: null,
 					server_manifest
 				};
@@ -662,7 +705,7 @@ export function set_building() {
 
 				secondary_build_started = true;
 
-				const { output } = /** @type {import('rollup').RollupOutput} */ (
+				const { output } = /** @type {import('vite').Rollup.RollupOutput} */ (
 					await vite.build({
 						configFile: vite_config.configFile,
 						// CLI args
@@ -680,24 +723,32 @@ export function set_building() {
 					})
 				);
 
+				copy(
+					`${out}/server/${kit.appDir}/immutable/assets`,
+					`${out}/client/${kit.appDir}/immutable/assets`
+				);
+
 				/** @type {import('vite').Manifest} */
 				const client_manifest = JSON.parse(read(`${out}/client/${vite_config.build.manifest}`));
 
+				const deps_of = /** @param {string} f */ (f) =>
+					find_deps(client_manifest, posixify(path.relative('.', f)), false);
+				const start = deps_of(`${runtime_directory}/client/start.js`);
+				const app = deps_of(`${kit.outDir}/generated/client-optimized/app.js`);
+
 				build_data.client = {
-					start: find_deps(
-						client_manifest,
-						posixify(path.relative('.', `${runtime_directory}/client/start.js`)),
-						false
-					),
-					app: find_deps(
-						client_manifest,
-						posixify(path.relative('.', `${kit.outDir}/generated/client-optimized/app.js`)),
-						false
+					start: start.file,
+					app: app.file,
+					imports: [...start.imports, ...app.imports],
+					stylesheets: [...start.stylesheets, ...app.stylesheets],
+					fonts: [...start.fonts, ...app.fonts],
+					uses_env_dynamic_public: output.some(
+						(chunk) => chunk.type === 'chunk' && chunk.modules[env_dynamic_public]
 					)
 				};
 
 				const css = output.filter(
-					/** @type {(value: any) => value is import('rollup').OutputAsset} */
+					/** @type {(value: any) => value is import('vite').Rollup.OutputAsset} */
 					(value) => value.type === 'asset' && value.fileName.endsWith('.css')
 				);
 
@@ -760,13 +811,17 @@ export function set_building() {
 							.cyan('npm run preview')} to preview your production build locally.`
 					);
 
-					// avoid making the manifest available to users
-					fs.unlinkSync(`${out}/client/${vite_config.build.manifest}`);
-					fs.unlinkSync(`${out}/server/${vite_config.build.manifest}`);
-
 					if (kit.adapter) {
 						const { adapt } = await import('../../core/adapt/index.js');
-						await adapt(svelte_config, build_data, metadata, prerendered, prerender_map, log);
+						await adapt(
+							svelte_config,
+							build_data,
+							metadata,
+							prerendered,
+							prerender_map,
+							log,
+							vite_config
+						);
 					} else {
 						console.log(colors.bold().yellow('\nNo adapter specified'));
 
@@ -814,7 +869,7 @@ function warn_overridden_config(config, resolved_config) {
 /**
  * @param {Record<string, any>} config
  * @param {Record<string, any>} resolved_config
- * @param {import('./types').EnforcedConfig} enforced_config
+ * @param {import('./types.js').EnforcedConfig} enforced_config
  * @param {string} path
  * @param {string[]} out used locally to compute the return value
  */
@@ -842,18 +897,18 @@ function find_overridden_config(config, resolved_config, enforced_config, path, 
 /**
  * @param {import('types').ValidatedConfig} config
  */
-const create_service_worker_module = (config) => `
-if (typeof self === 'undefined' || self instanceof ServiceWorkerGlobalScope === false) {
-	throw new Error('This module can only be imported inside a service worker');
-}
+const create_service_worker_module = (config) => dedent`
+	if (typeof self === 'undefined' || self instanceof ServiceWorkerGlobalScope === false) {
+		throw new Error('This module can only be imported inside a service worker');
+	}
 
-export const build = [];
-export const files = [
-	${create_assets(config)
-		.filter((asset) => config.kit.serviceWorker.files(asset.file))
-		.map((asset) => `${s(`${config.kit.paths.base}/${asset.file}`)}`)
-		.join(',\n\t\t\t\t')}
-];
-export const prerendered = [];
-export const version = ${s(config.kit.version.name)};
+	export const build = [];
+	export const files = [
+		${create_assets(config)
+			.filter((asset) => config.kit.serviceWorker.files(asset.file))
+			.map((asset) => `${s(`${config.kit.paths.base}/${asset.file}`)}`)
+			.join(',\n')}
+	];
+	export const prerendered = [];
+	export const version = ${s(config.kit.version.name)};
 `;

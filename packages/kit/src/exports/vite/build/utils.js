@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { normalizePath } from 'vite';
 
 /**
  * Adds transitive JS and CSS dependencies to the js and css inputs.
@@ -72,20 +73,14 @@ export function find_deps(manifest, entry, add_dynamic_css) {
  */
 export function resolve_symlinks(manifest, file) {
 	while (!manifest[file]) {
-		file = path.relative('.', fs.realpathSync(file));
+		const next = normalizePath(path.relative('.', fs.realpathSync(file)));
+		if (next === file) throw new Error(`Could not find file "${file}" in Vite manifest`);
+		file = next;
 	}
 
 	const chunk = manifest[file];
 
 	return { chunk, file };
-}
-
-/**
- * @param {import('types').ValidatedKitConfig} config
- * @returns {string}
- */
-export function assets_base(config) {
-	return (config.paths.assets || config.paths.base || '.') + '/';
 }
 
 const method_names = new Set(['GET', 'HEAD', 'PUT', 'POST', 'DELETE', 'PATCH', 'OPTIONS']);
@@ -97,4 +92,12 @@ const method_names = new Set(['GET', 'HEAD', 'PUT', 'POST', 'DELETE', 'PATCH', '
  */
 export function is_http_method(str) {
 	return method_names.has(str);
+}
+
+/**
+ * @param {import('types').ValidatedKitConfig} config
+ * @returns {string}
+ */
+export function assets_base(config) {
+	return (config.paths.assets || config.paths.base || '.') + '/';
 }

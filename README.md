@@ -17,11 +17,18 @@ Web development, streamlined. Read the [documentation](https://kit.svelte.dev/do
 | [@sveltejs/adapter-static](packages/adapter-static)                         | [Changelog](packages/adapter-static/CHANGELOG.md)             |
 | [@sveltejs/adapter-vercel](packages/adapter-vercel)                         | [Changelog](packages/adapter-vercel/CHANGELOG.md)             |
 | [@sveltejs/amp](packages/amp)                                               | [Changelog](packages/amp/CHANGELOG.md)                        |
+| [@sveltejs/enhanced-img](packages/enhanced-img)                             | [Changelog](packages/enhanced-img/CHANGELOG.md)               |
 | [@sveltejs/package](packages/package)                                       | [Changelog](packages/package/CHANGELOG.md)                    |
 | [create-svelte](packages/create-svelte)                                     | [Changelog](packages/create-svelte/CHANGELOG.md)              |
 | [svelte-migrate](packages/migrate)                                          | [Changelog](packages/migrate/CHANGELOG.md)                    |
 
 [Additional adapters](<(https://sveltesociety.dev/components#adapters)>) are maintained by the community.
+
+## Bug reporting
+
+Please make sure the issue you're reporting involves SvelteKit. Many issues related to how a project builds originate from [Vite](https://vitejs.dev/), which is used to build a SvelteKit project. You can create a new Vite project with `npm create vite@latest` for client-side only repros and `npm create vite-extra@latest` for SSR or library repros.
+
+If an issue originates from Vite, please report it in the [Vite issue tracker](https://github.com/vitejs/vite/issues).
 
 ## Contributing
 

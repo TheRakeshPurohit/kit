@@ -1,9 +1,8 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { installPolyfills } from '../../exports/node/polyfills.js';
 import { mkdirp, posixify, walk } from '../../utils/filesystem.js';
-import { should_polyfill } from '../../utils/platform.js';
 import { decode_uri, is_root_relative, resolve } from '../../utils/url.js';
 import { escape_html_attr } from '../../utils/escape.js';
 import { logger } from '../utils.js';
@@ -12,6 +11,7 @@ import { get_route_segments } from '../../utils/routing.js';
 import { queue } from './queue.js';
 import { crawl } from './crawl.js';
 import { forked } from '../../utils/fork.js';
+import * as devalue from 'devalue';
 
 export default forked(import.meta.url, prerender);
 
@@ -25,7 +25,7 @@ export default forked(import.meta.url, prerender);
  * }} opts
  */
 async function prerender({ out, manifest_path, metadata, verbose, env }) {
-	/** @type {import('types').SSRManifest} */
+	/** @type {import('@sveltejs/kit').SSRManifest} */
 	const manifest = (await import(pathToFileURL(manifest_path).href)).manifest;
 
 	/** @type {import('types').ServerInternalModule} */
@@ -93,9 +93,7 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 	/** @type {import('types').Logger} */
 	const log = logger({ verbose });
 
-	if (should_polyfill) {
-		installPolyfills();
-	}
+	installPolyfills();
 
 	/** @type {Map<string, string>} */
 	const saved = new Map();
@@ -127,6 +125,14 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 		}
 	);
 
+	const handle_entry_generator_mismatch = normalise_error_handler(
+		log,
+		config.prerender.handleEntryGeneratorMismatch,
+		({ generatedFromId, entry, matchedId }) => {
+			return `The entries export from ${generatedFromId} generated entry ${entry}, which was matched by ${matchedId} - see the \`handleEntryGeneratorMismatch\` option in https://kit.svelte.dev/docs/configuration#prerender for more info.`;
+		}
+	);
+
 	const q = queue(config.prerender.concurrency);
 
 	/**
@@ -144,6 +150,14 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 	}
 
 	const files = new Set(walk(`${out}/client`).map(posixify));
+	files.add(`${config.appDir}/env.js`);
+
+	const immutable = `${config.appDir}/immutable`;
+	if (existsSync(`${out}/server/${immutable}`)) {
+		for (const file of walk(`${out}/server/${immutable}`)) {
+			files.add(posixify(`${config.appDir}/immutable/${file}`));
+		}
+	}
 	const seen = new Set();
 	const written = new Set();
 
@@ -157,23 +171,25 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 	 * @param {string | null} referrer
 	 * @param {string} decoded
 	 * @param {string} [encoded]
+	 * @param {string} [generated_from_id]
 	 */
-	function enqueue(referrer, decoded, encoded) {
+	function enqueue(referrer, decoded, encoded, generated_from_id) {
 		if (seen.has(decoded)) return;
 		seen.add(decoded);
 
 		const file = decoded.slice(config.paths.base.length + 1);
 		if (files.has(file)) return;
 
-		return q.add(() => visit(decoded, encoded || encodeURI(decoded), referrer));
+		return q.add(() => visit(decoded, encoded || encodeURI(decoded), referrer, generated_from_id));
 	}
 
 	/**
 	 * @param {string} decoded
 	 * @param {string} encoded
 	 * @param {string?} referrer
+	 * @param {string} [generated_from_id]
 	 */
-	async function visit(decoded, encoded, referrer) {
+	async function visit(decoded, encoded, referrer, generated_from_id) {
 		if (!decoded.startsWith(config.paths.base)) {
 			handle_http_error({ status: 404, path: decoded, referrer, referenceType: 'linked' });
 			return;
@@ -198,6 +214,20 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 				return readFileSync(join(config.files.assets, file));
 			}
 		});
+
+		const encoded_id = response.headers.get('x-sveltekit-routeid');
+		const decoded_id = encoded_id && decode_uri(encoded_id);
+		if (
+			decoded_id !== null &&
+			generated_from_id !== undefined &&
+			decoded_id !== generated_from_id
+		) {
+			handle_entry_generator_mismatch({
+				generatedFromId: generated_from_id,
+				entry: decoded,
+				matchedId: decoded_id
+			});
+		}
 
 		const body = Buffer.from(await response.arrayBuffer());
 
@@ -240,17 +270,14 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 		const headers = Object.fromEntries(response.headers);
 
 		if (config.prerender.crawl && headers['content-type'] === 'text/html') {
-			const { ids, hrefs } = crawl(body.toString());
+			const { ids, hrefs } = crawl(body.toString(), decoded);
 
 			actual_hashlinks.set(decoded, ids);
 
 			for (const href of hrefs) {
-				if (href.startsWith('data:')) continue;
+				if (!is_root_relative(href)) continue;
 
-				const resolved = resolve(encoded, href);
-				if (!is_root_relative(resolved)) continue;
-
-				const { pathname, search, hash } = new URL(resolved, 'http://localhost');
+				const { pathname, search, hash } = new URL(href, 'http://localhost');
 
 				if (search) {
 					// TODO warn that query strings have no effect on statically-exported pages
@@ -312,7 +339,11 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 
 					writeFileSync(
 						dest,
-						`<meta http-equiv="refresh" content=${escape_html_attr(`0;url=${location}`)}>`
+						`<script>location.href=${devalue.uneval(
+							location
+						)};</script><meta http-equiv="refresh" content=${escape_html_attr(
+							`0;url=${location}`
+						)}>`
 					);
 
 					written.add(file);
@@ -334,7 +365,22 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 		}
 
 		if (response.status === 200) {
-			mkdirp(dirname(dest));
+			if (existsSync(dest) && statSync(dest).isDirectory()) {
+				throw new Error(
+					`Cannot save ${decoded} as it is already a directory. See https://kit.svelte.dev/docs/page-options#prerender-route-conflicts for more information`
+				);
+			}
+
+			const dir = dirname(dest);
+
+			if (existsSync(dir) && !statSync(dir).isDirectory()) {
+				const parent = decoded.split('/').slice(0, -1).join('/');
+				throw new Error(
+					`Cannot save ${decoded} as ${parent} is already a file. See https://kit.svelte.dev/docs/page-options#prerender-route-conflicts for more information`
+				);
+			}
+
+			mkdirp(dir);
 
 			log.info(`${response.status} ${decoded}`);
 			writeFileSync(dest, body);
@@ -359,9 +405,18 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 		saved.set(file, dest);
 	}
 
+	/** @type {Array<{ id: string, entries: Array<string>}>} */
+	const route_level_entries = [];
+	for (const [id, { entries }] of metadata.routes.entries()) {
+		if (entries) {
+			route_level_entries.push({ id, entries });
+		}
+	}
+
 	if (
 		config.prerender.entries.length > 1 ||
 		config.prerender.entries[0] !== '*' ||
+		route_level_entries.length > 0 ||
 		prerender_map.size > 0
 	) {
 		// Only log if we're actually going to do something to not confuse users
@@ -372,13 +427,23 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 		if (entry === '*') {
 			for (const [id, prerender] of prerender_map) {
 				if (prerender) {
-					if (id.includes('[')) continue;
-					const path = `/${get_route_segments(id).join('/')}`;
+					// remove optional parameters from the route
+					const segments = get_route_segments(id).filter((segment) => !segment.startsWith('[['));
+					const processed_id = '/' + segments.join('/');
+
+					if (processed_id.includes('[')) continue;
+					const path = `/${get_route_segments(processed_id).join('/')}`;
 					enqueue(null, config.paths.base + path);
 				}
 			}
 		} else {
 			enqueue(null, config.paths.base + entry);
+		}
+	}
+
+	for (const { id, entries } of route_level_entries) {
+		for (const entry of entries) {
+			enqueue(null, config.paths.base + entry, undefined, id);
 		}
 	}
 
@@ -409,10 +474,10 @@ async function prerender({ out, manifest_path, metadata, verbose, env }) {
 	}
 
 	if (not_prerendered.length > 0) {
+		const list = not_prerendered.map((id) => `  - ${id}`).join('\n');
+
 		throw new Error(
-			`The following routes were marked as prerenderable, but were not prerendered because they were not found while crawling your app:\n${not_prerendered.map(
-				(id) => `  - ${id}`
-			)}\n\nSee https://kit.svelte.dev/docs/page-options#prerender-troubleshooting for info on how to solve this`
+			`The following routes were marked as prerenderable, but were not prerendered because they were not found while crawling your app:\n${list}\n\nSee https://kit.svelte.dev/docs/page-options#prerender-troubleshooting for info on how to solve this`
 		);
 	}
 

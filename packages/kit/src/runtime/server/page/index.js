@@ -1,8 +1,8 @@
 import { text } from '../../../exports/index.js';
 import { compact } from '../../../utils/array.js';
-import { normalize_error } from '../../../utils/error.js';
+import { get_status, normalize_error } from '../../../utils/error.js';
 import { add_data_suffix } from '../../../utils/url.js';
-import { HttpError, Redirect } from '../../control.js';
+import { Redirect } from '../../control.js';
 import { redirect_response, static_error_page, handle_error_and_jsonify } from '../utils.js';
 import {
 	handle_action_json_request,
@@ -17,24 +17,26 @@ import { get_option } from '../../../utils/options.js';
 import { get_data_json } from '../data/index.js';
 
 /**
- * @param {import('types').RequestEvent} event
- * @param {import('types').SSRRoute} route
+ * The maximum request depth permitted before assuming we're stuck in an infinite loop
+ */
+const MAX_DEPTH = 10;
+
+/**
+ * @param {import('@sveltejs/kit').RequestEvent} event
  * @param {import('types').PageNodeIndexes} page
  * @param {import('types').SSROptions} options
- * @param {import('types').SSRManifest} manifest
+ * @param {import('@sveltejs/kit').SSRManifest} manifest
  * @param {import('types').SSRState} state
  * @param {import('types').RequiredResolveOptions} resolve_opts
  * @returns {Promise<Response>}
  */
-export async function render_page(event, route, page, options, manifest, state, resolve_opts) {
-	if (state.initiator === route) {
+export async function render_page(event, page, options, manifest, state, resolve_opts) {
+	if (state.depth > MAX_DEPTH) {
 		// infinite request cycle detected
 		return text(`Not found: ${event.url.pathname}`, {
-			status: 404
+			status: 404 // TODO in some cases this should be 500. not sure how to differentiate
 		});
 	}
-
-	state.initiator = route;
 
 	if (is_action_json_request(event)) {
 		const node = await manifest._.nodes[page.leaf]();
@@ -52,7 +54,7 @@ export async function render_page(event, route, page, options, manifest, state, 
 
 		let status = 200;
 
-		/** @type {import('types').ActionResult | undefined} */
+		/** @type {import('@sveltejs/kit').ActionResult | undefined} */
 		let action_result = undefined;
 
 		if (is_action_request(event)) {
@@ -63,8 +65,7 @@ export async function render_page(event, route, page, options, manifest, state, 
 				return redirect_response(action_result.status, action_result.location);
 			}
 			if (action_result?.type === 'error') {
-				const error = action_result.error;
-				status = error instanceof HttpError ? error.status : 500;
+				status = get_status(action_result.error);
 			}
 			if (action_result?.type === 'failure') {
 				status = action_result.status;
@@ -76,39 +77,14 @@ export async function render_page(event, route, page, options, manifest, state, 
 
 		// it's crucial that we do this before returning the non-SSR response, otherwise
 		// SvelteKit will erroneously believe that the path has been prerendered,
-		// causing functions to be omitted from the manifesst generated later
-		const should_prerender = get_option(nodes, 'prerender');
-
+		// causing functions to be omitted from the manifest generated later
+		const should_prerender = get_option(nodes, 'prerender') ?? false;
 		if (should_prerender) {
 			const mod = leaf_node.server;
 			if (mod?.actions) {
 				throw new Error('Cannot prerender pages with actions');
 			}
 		} else if (state.prerendering) {
-			// Try to render the shell when ssr is false and prerendering not explicitly disabled.
-			// People can opt out of this behavior by explicitly setting prerender to false.
-			if (
-				should_prerender !== false &&
-				get_option(nodes, 'ssr') === false &&
-				!leaf_node.server?.actions
-			) {
-				return await render_response({
-					branch: [],
-					fetched: [],
-					page_config: {
-						ssr: false,
-						csr: get_option(nodes, 'csr') ?? true
-					},
-					status,
-					error: null,
-					event,
-					options,
-					manifest,
-					state,
-					resolve_opts
-				});
-			}
-
 			// if the page isn't marked as prerenderable, then bail out at this point
 			return new Response(undefined, {
 				status: 204
@@ -119,10 +95,10 @@ export async function render_page(event, route, page, options, manifest, state, 
 		// inherit the prerender option of the page
 		state.prerender_default = should_prerender;
 
-		/** @type {import('./types').Fetched[]} */
+		/** @type {import('./types.js').Fetched[]} */
 		const fetched = [];
 
-		if (get_option(nodes, 'ssr') === false) {
+		if (get_option(nodes, 'ssr') === false && !state.prerendering) {
 			return await render_response({
 				branch: [],
 				fetched,
@@ -141,7 +117,7 @@ export async function render_page(event, route, page, options, manifest, state, 
 		}
 
 		/** @type {Array<import('./types.js').Loaded | null>} */
-		let branch = [];
+		const branch = [];
 
 		/** @type {Error | null} */
 		let load_error = null;
@@ -244,7 +220,7 @@ export async function render_page(event, route, page, options, manifest, state, 
 						return redirect_response(err.status, err.location);
 					}
 
-					const status = err instanceof HttpError ? err.status : 500;
+					const status = get_status(err);
 					const error = await handle_error_and_jsonify(event, options, err);
 
 					while (i--) {
@@ -313,7 +289,7 @@ export async function render_page(event, route, page, options, manifest, state, 
 			resolve_opts,
 			page_config: {
 				csr: get_option(nodes, 'csr') ?? true,
-				ssr: true
+				ssr: get_option(nodes, 'ssr') ?? true
 			},
 			status,
 			error: null,
@@ -322,7 +298,7 @@ export async function render_page(event, route, page, options, manifest, state, 
 			fetched
 		});
 	} catch (e) {
-		// if we end up here, it means the data loaded successfull
+		// if we end up here, it means the data loaded successfully
 		// but the page failed to render, or that a prerendering error occurred
 		return await respond_with_error({
 			event,

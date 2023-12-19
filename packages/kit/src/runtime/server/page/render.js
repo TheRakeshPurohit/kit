@@ -1,16 +1,18 @@
 import * as devalue from 'devalue';
 import { readable, writable } from 'svelte/store';
 import { DEV } from 'esm-env';
-import { assets, base } from '__sveltekit/paths';
+import * as paths from '__sveltekit/paths';
 import { hash } from '../../hash.js';
 import { serialize_data } from './serialize_data.js';
 import { s } from '../../../utils/misc.js';
 import { Csp } from './csp.js';
 import { uneval_action_response } from './actions.js';
 import { clarify_devalue_error, stringify_uses, handle_error_and_jsonify } from '../utils.js';
-import { public_env } from '../../shared-server.js';
+import { public_env, safe_public_env } from '../../shared-server.js';
 import { text } from '../../../exports/index.js';
 import { create_async_iterator } from '../../../utils/streaming.js';
+import { SVELTE_KIT_ASSETS } from '../../../constants.js';
+import { SCHEME } from '../../../utils/url.js';
 
 // TODO rename this function/module
 
@@ -24,17 +26,17 @@ const encoder = new TextEncoder();
 /**
  * Creates the HTML response.
  * @param {{
- *   branch: Array<import('./types').Loaded>;
- *   fetched: Array<import('./types').Fetched>;
+ *   branch: Array<import('./types.js').Loaded>;
+ *   fetched: Array<import('./types.js').Fetched>;
  *   options: import('types').SSROptions;
- *   manifest: import('types').SSRManifest;
+ *   manifest: import('@sveltejs/kit').SSRManifest;
  *   state: import('types').SSRState;
  *   page_config: { ssr: boolean; csr: boolean };
  *   status: number;
  *   error: App.Error | null;
- *   event: import('types').RequestEvent;
+ *   event: import('@sveltejs/kit').RequestEvent;
  *   resolve_opts: import('types').RequiredResolveOptions;
- *   action_result?: import('types').ActionResult;
+ *   action_result?: import('@sveltejs/kit').ActionResult;
  * }} opts
  */
 export async function render_response({
@@ -62,9 +64,9 @@ export async function render_response({
 
 	const { client } = manifest._;
 
-	const modulepreloads = new Set([...client.start.imports, ...client.app.imports]);
-	const stylesheets = new Set(client.app.stylesheets);
-	const fonts = new Set(client.app.fonts);
+	const modulepreloads = new Set(client.imports);
+	const stylesheets = new Set(client.stylesheets);
+	const fonts = new Set(client.fonts);
 
 	/** @type {Set<string>} */
 	const link_header_preloads = new Set();
@@ -79,6 +81,32 @@ export async function render_response({
 		action_result?.type === 'success' || action_result?.type === 'failure'
 			? action_result.data ?? null
 			: null;
+
+	/** @type {string} */
+	let base = paths.base;
+
+	/** @type {string} */
+	let assets = paths.assets;
+
+	/**
+	 * An expression that will evaluate in the client to determine the resolved base path.
+	 * We use a relative path when possible to support IPFS, the internet archive, etc.
+	 */
+	let base_expression = s(paths.base);
+
+	// if appropriate, use relative paths for greater portability
+	if (paths.relative && !state.prerendering?.fallback) {
+		const segments = event.url.pathname.slice(paths.base.length).split('/').slice(2);
+
+		base = segments.map(() => '..').join('/') || '.';
+
+		// resolve e.g. '../..' against current location, then remove trailing slash
+		base_expression = `new URL(${s(base)}, location).pathname.slice(0, -1)`;
+
+		if (!paths.assets || (paths.assets[0] === '/' && paths.assets !== SVELTE_KIT_ASSETS)) {
+			assets = base;
+		}
+	}
 
 	if (page_config.ssr) {
 		if (__SVELTEKIT_DEV__ && !branch.at(-1)?.node.component) {
@@ -113,20 +141,25 @@ export async function render_response({
 			status,
 			url: event.url,
 			data,
-			form: form_value
+			form: form_value,
+			state: {}
 		};
+
+		// use relative paths during rendering, so that the resulting HTML is as
+		// portable as possible, but reset afterwards
+		if (paths.relative) paths.override({ base, assets });
 
 		if (__SVELTEKIT_DEV__) {
 			const fetch = globalThis.fetch;
 			let warned = false;
 			globalThis.fetch = (info, init) => {
-				if (typeof info === 'string' && !/^\w+:\/\//.test(info)) {
+				if (typeof info === 'string' && !SCHEME.test(info)) {
 					throw new Error(
 						`Cannot call \`fetch\` eagerly during server side rendering with relative URL (${info}) — put your \`fetch\` calls inside \`onMount\` or a \`load\` function instead`
 					);
 				} else if (!warned) {
 					console.warn(
-						`Avoid calling \`fetch\` eagerly during server side rendering — put your \`fetch\` calls inside \`onMount\` or a \`load\` function instead`
+						'Avoid calling `fetch` eagerly during server side rendering — put your `fetch` calls inside `onMount` or a `load` function instead'
 					);
 					warned = true;
 				}
@@ -138,9 +171,14 @@ export async function render_response({
 				rendered = options.root.render(props);
 			} finally {
 				globalThis.fetch = fetch;
+				paths.reset();
 			}
 		} else {
-			rendered = options.root.render(props);
+			try {
+				rendered = options.root.render(props);
+			} finally {
+				paths.reset();
+			}
 		}
 
 		for (const { node } of branch) {
@@ -156,35 +194,6 @@ export async function render_response({
 		rendered = { head: '', html: '', css: { code: '', map: null } };
 	}
 
-	/**
-	 * The prefix to use for static assets. Replaces `%sveltekit.assets%` in the template
-	 * @type {string}
-	 */
-	let resolved_assets;
-
-	/**
-	 * An expression that will evaluate in the client to determine the resolved asset path
-	 */
-	let asset_expression;
-
-	if (assets) {
-		// if an asset path is specified, use it
-		resolved_assets = assets;
-		asset_expression = s(assets);
-	} else if (state.prerendering?.fallback) {
-		// if we're creating a fallback page, asset paths need to be root-relative
-		resolved_assets = base;
-		asset_expression = s(base);
-	} else {
-		// otherwise we want asset paths to be relative to the page, so that they
-		// will work in odd contexts like IPFS, the internet archive, and so on
-		const segments = event.url.pathname.slice(base.length).split('/').slice(2);
-		resolved_assets = segments.length > 0 ? segments.map(() => '..').join('/') : '.';
-		asset_expression = `new URL(${s(
-			resolved_assets
-		)}, location.href).pathname.replace(/^\\\/$/, '')`;
-	}
-
 	let head = '';
 	let body = rendered.html;
 
@@ -198,9 +207,9 @@ export async function render_response({
 			// Vite makes the start script available through the base path and without it.
 			// We load it via the base path in order to support remote IDE environments which proxy
 			// all URLs under the base path during development.
-			return base + path;
+			return paths.base + path;
 		}
-		return `${resolved_assets}/${path}`;
+		return `${assets}/${path}`;
 	};
 
 	if (inline_styles.size > 0) {
@@ -217,20 +226,20 @@ export async function render_response({
 	for (const dep of stylesheets) {
 		const path = prefixed(dep);
 
-		if (resolve_opts.preload({ type: 'css', path })) {
-			const attributes = ['rel="stylesheet"'];
+		const attributes = ['rel="stylesheet"'];
 
-			if (inline_styles.has(dep)) {
-				// don't load stylesheets that are already inlined
-				// include them in disabled state so that Vite can detect them and doesn't try to add them
-				attributes.push('disabled', 'media="(max-width: 0)"');
-			} else {
+		if (inline_styles.has(dep)) {
+			// don't load stylesheets that are already inlined
+			// include them in disabled state so that Vite can detect them and doesn't try to add them
+			attributes.push('disabled', 'media="(max-width: 0)"');
+		} else {
+			if (resolve_opts.preload({ type: 'css', path })) {
 				const preload_atts = ['rel="preload"', 'as="style"'];
 				link_header_preloads.add(`<${encodeURI(path)}>; ${preload_atts.join(';')}; nopush`);
 			}
-
-			head += `\n\t\t<link href="${path}" ${attributes.join(' ')}>`;
 		}
+
+		head += `\n\t\t<link href="${path}" ${attributes.join(' ')}>`;
 	}
 
 	for (const dep of fonts) {
@@ -250,7 +259,7 @@ export async function render_response({
 		}
 	}
 
-	const global = `__sveltekit_${options.version_hash}`;
+	const global = __SVELTEKIT_DEV__ ? '__sveltekit_dev' : `__sveltekit_${options.version_hash}`;
 
 	const { data, chunks } = get_data(
 		event,
@@ -268,29 +277,34 @@ export async function render_response({
 	}
 
 	if (page_config.csr) {
+		if (client.uses_env_dynamic_public && state.prerendering) {
+			modulepreloads.add(`${options.app_dir}/env.js`);
+		}
+
 		const included_modulepreloads = Array.from(modulepreloads, (dep) => prefixed(dep)).filter(
 			(path) => resolve_opts.preload({ type: 'js', path })
 		);
 
 		for (const path of included_modulepreloads) {
-			// we use modulepreload with the Link header for Chrome, along with
-			// <link rel="preload"> for Safari. This results in the fastest loading in
-			// the most used browsers, with no double-loading. Note that we need to use
-			// .mjs extensions for `preload` to behave like `modulepreload` in Chrome
+			// see the kit.output.preloadStrategy option for details on why we have multiple options here
 			link_header_preloads.add(`<${encodeURI(path)}>; rel="modulepreload"; nopush`);
-			head += `\n\t\t<link rel="preload" as="script" crossorigin="anonymous" href="${path}">`;
+			if (options.preload_strategy !== 'modulepreload') {
+				head += `\n\t\t<link rel="preload" as="script" crossorigin="anonymous" href="${path}">`;
+			} else if (state.prerendering) {
+				head += `\n\t\t<link rel="modulepreload" href="${path}">`;
+			}
 		}
 
 		const blocks = [];
 
 		const properties = [
-			`env: ${s(public_env)}`,
-			`assets: ${asset_expression}`,
-			`element: document.currentScript.parentElement`
-		];
+			paths.assets && `assets: ${s(paths.assets)}`,
+			`base: ${base_expression}`,
+			`env: ${!client.uses_env_dynamic_public || state.prerendering ? null : s(public_env)}`
+		].filter(Boolean);
 
 		if (chunks) {
-			blocks.push(`const deferred = new Map();`);
+			blocks.push('const deferred = new Map();');
 
 			properties.push(`defer: (id) => new Promise((fulfil, reject) => {
 							deferred.set(id, { fulfil, reject });
@@ -309,7 +323,9 @@ export async function render_response({
 						${properties.join(',\n\t\t\t\t\t\t')}
 					};`);
 
-		const args = [`app`, `${global}.element`];
+		const args = ['app', 'element'];
+
+		blocks.push('const element = document.currentScript.parentElement;');
 
 		if (page_config.ssr) {
 			const serialized = { form: 'null', error: 'null' };
@@ -329,7 +345,7 @@ export async function render_response({
 
 			const hydrate = [
 				`node_ids: [${branch.map(({ node }) => node.index).join(', ')}]`,
-				`data`,
+				'data',
 				`form: ${serialized.form}`,
 				`error: ${serialized.error}`
 			];
@@ -346,14 +362,14 @@ export async function render_response({
 		}
 
 		blocks.push(`Promise.all([
-						import(${s(prefixed(client.start.file))}),
-						import(${s(prefixed(client.app.file))})
+						import(${s(prefixed(client.start))}),
+						import(${s(prefixed(client.app))})
 					]).then(([kit, app]) => {
 						kit.start(${args.join(', ')});
 					});`);
 
 		if (options.service_worker) {
-			const opts = __SVELTEKIT_DEV__ ? `, { type: 'module' }` : '';
+			const opts = __SVELTEKIT_DEV__ ? ", { type: 'module' }" : '';
 
 			// we use an anonymous function instead of an arrow function to support
 			// older browsers (https://github.com/sveltejs/kit/pull/5417)
@@ -418,9 +434,9 @@ export async function render_response({
 	const html = options.templates.app({
 		head,
 		body,
-		assets: resolved_assets,
+		assets,
 		nonce: /** @type {string} */ (csp.nonce),
-		env: public_env
+		env: safe_public_env
 	});
 
 	// TODO flush chunks as early as we can
@@ -456,7 +472,7 @@ export async function render_response({
 		? text(transformed, {
 				status,
 				headers
-		  })
+			})
 		: new Response(
 				new ReadableStream({
 					async start(controller) {
@@ -474,13 +490,13 @@ export async function render_response({
 						'content-type': 'text/html'
 					}
 				}
-		  );
+			);
 }
 
 /**
  * If the serialized data contains promises, `chunks` will be an
  * async iterable containing their resolutions
- * @param {import('types').RequestEvent} event
+ * @param {import('@sveltejs/kit').RequestEvent} event
  * @param {import('types').SSROptions} options
  * @param {Array<import('types').ServerDataNode | null>} nodes
  * @param {string} global

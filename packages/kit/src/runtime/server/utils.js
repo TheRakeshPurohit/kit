@@ -1,8 +1,10 @@
+import { DEV } from 'esm-env';
 import { json, text } from '../../exports/index.js';
-import { coalesce_to_error } from '../../utils/error.js';
+import { coalesce_to_error, get_message, get_status } from '../../utils/error.js';
 import { negotiate } from '../../utils/http.js';
 import { HttpError } from '../control.js';
 import { fix_stack_trace } from '../shared-server.js';
+import { ENDPOINT_METHODS } from '../../constants.js';
 
 /** @param {any} body */
 export function is_pojo(body) {
@@ -15,11 +17,6 @@ export function is_pojo(body) {
 
 	return true;
 }
-
-/** @type {import('types').SSRErrorPage} */
-export const GENERIC_ERROR = {
-	id: '__error'
-};
 
 /**
  * @param {Partial<Record<import('types').HttpMethod, any>>} mod
@@ -38,13 +35,9 @@ export function method_not_allowed(mod, method) {
 
 /** @param {Partial<Record<import('types').HttpMethod, any>>} mod */
 export function allowed_methods(mod) {
-	const allowed = [];
+	const allowed = ENDPOINT_METHODS.filter((method) => method in mod);
 
-	for (const method in ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
-		if (method in mod) allowed.push(method);
-	}
-
-	if (mod.GET || mod.HEAD) allowed.push('HEAD');
+	if ('GET' in mod || 'HEAD' in mod) allowed.push('HEAD');
 
 	return allowed;
 }
@@ -57,23 +50,30 @@ export function allowed_methods(mod) {
  * @param {string} message
  */
 export function static_error_page(options, status, message) {
-	return text(options.templates.error({ status, message }), {
+	let page = options.templates.error({ status, message });
+
+	if (DEV) {
+		// inject Vite HMR client, for easier debugging
+		page = page.replace('</head>', '<script type="module" src="/@vite/client"></script></head>');
+	}
+
+	return text(page, {
 		headers: { 'content-type': 'text/html; charset=utf-8' },
 		status
 	});
 }
 
 /**
- * @param {import('types').RequestEvent} event
+ * @param {import('@sveltejs/kit').RequestEvent} event
  * @param {import('types').SSROptions} options
  * @param {unknown} error
  */
 export async function handle_fatal_error(event, options, error) {
 	error = error instanceof HttpError ? error : coalesce_to_error(error);
-	const status = error instanceof HttpError ? error.status : 500;
+	const status = get_status(error);
 	const body = await handle_error_and_jsonify(event, options, error);
 
-	// ideally we'd use sec-fetch-dest instead, but Safari — quelle surprise — doesn't support it
+	// ideally we'd use sec-fetch-dest instead, but Safari — quelle surprise — doesn't support it
 	const type = negotiate(event.request.headers.get('accept') || 'text/html', [
 		'application/json',
 		'text/html'
@@ -89,7 +89,7 @@ export async function handle_fatal_error(event, options, error) {
 }
 
 /**
- * @param {import('types').RequestEvent} event
+ * @param {import('@sveltejs/kit').RequestEvent} event
  * @param {import('types').SSROptions} options
  * @param {any} error
  * @returns {Promise<App.Error>}
@@ -97,25 +97,16 @@ export async function handle_fatal_error(event, options, error) {
 export async function handle_error_and_jsonify(event, options, error) {
 	if (error instanceof HttpError) {
 		return error.body;
-	} else {
-		if (__SVELTEKIT_DEV__ && typeof error == 'object') {
-			error = new Proxy(error, {
-				get: (target, property) => {
-					if (property === 'stack') {
-						return fix_stack_trace(target.stack);
-					}
-
-					return Reflect.get(target, property, target);
-				}
-			});
-		}
-
-		return (
-			(await options.hooks.handleError({ error, event })) ?? {
-				message: event.route.id != null ? 'Internal Error' : 'Not Found'
-			}
-		);
 	}
+
+	if (__SVELTEKIT_DEV__ && typeof error == 'object') {
+		fix_stack_trace(error);
+	}
+
+	const status = get_status(error);
+	const message = get_message(error);
+
+	return (await options.hooks.handleError({ error, event, status, message })) ?? { message };
 }
 
 /**
@@ -131,7 +122,7 @@ export function redirect_response(status, location) {
 }
 
 /**
- * @param {import('types').RequestEvent} event
+ * @param {import('@sveltejs/kit').RequestEvent} event
  * @param {Error & { path: string }} error
  */
 export function clarify_devalue_error(event, error) {
@@ -157,13 +148,31 @@ export function stringify_uses(node) {
 		uses.push(`"dependencies":${JSON.stringify(Array.from(node.uses.dependencies))}`);
 	}
 
+	if (node.uses && node.uses.search_params.size > 0) {
+		uses.push(`"search_params":${JSON.stringify(Array.from(node.uses.search_params))}`);
+	}
+
 	if (node.uses && node.uses.params.size > 0) {
 		uses.push(`"params":${JSON.stringify(Array.from(node.uses.params))}`);
 	}
 
-	if (node.uses?.parent) uses.push(`"parent":1`);
-	if (node.uses?.route) uses.push(`"route":1`);
-	if (node.uses?.url) uses.push(`"url":1`);
+	if (node.uses?.parent) uses.push('"parent":1');
+	if (node.uses?.route) uses.push('"route":1');
+	if (node.uses?.url) uses.push('"url":1');
 
 	return `"uses":{${uses.join(',')}}`;
+}
+
+/**
+ * @param {string} message
+ * @param {number} offset
+ */
+export function warn_with_callsite(message, offset = 0) {
+	if (DEV) {
+		const stack = fix_stack_trace(new Error()).split('\n');
+		const line = stack.at(3 + offset);
+		message += `\n${line}`;
+	}
+
+	console.warn(message);
 }

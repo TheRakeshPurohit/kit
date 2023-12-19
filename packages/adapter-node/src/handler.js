@@ -37,7 +37,7 @@ function serve(path, client = false) {
 				client &&
 				((res, pathname) => {
 					// only apply to build directory, not e.g. version.json
-					if (pathname.startsWith(`/${manifest.appPath}/immutable/`)) {
+					if (pathname.startsWith(`/${manifest.appPath}/immutable/`) && res.statusCode === 200) {
 						res.setHeader('cache-control', 'public,max-age=31536000,immutable');
 					}
 				})
@@ -76,28 +76,11 @@ function serve_prerendered() {
 
 /** @type {import('polka').Middleware} */
 const ssr = async (req, res) => {
-	/** @type {Request | undefined} */
-	let request;
-
-	try {
-		request = await getRequest({
-			base: origin || get_origin(req.headers),
-			request: req,
-			bodySizeLimit: body_size_limit
-		});
-	} catch (err) {
-		res.statusCode = err.status || 400;
-		res.end('Invalid request body');
-		return;
-	}
-
-	if (address_header && !(address_header in req.headers)) {
-		throw new Error(
-			`Address header was specified with ${
-				ENV_PREFIX + 'ADDRESS_HEADER'
-			}=${address_header} but is absent from request`
-		);
-	}
+	const request = await getRequest({
+		base: origin || get_origin(req.headers),
+		request: req,
+		bodySizeLimit: body_size_limit
+	});
 
 	setResponse(
 		res,
@@ -105,6 +88,14 @@ const ssr = async (req, res) => {
 			platform: { req },
 			getClientAddress: () => {
 				if (address_header) {
+					if (!(address_header in req.headers)) {
+						throw new Error(
+							`Address header was specified with ${
+								ENV_PREFIX + 'ADDRESS_HEADER'
+							}=${address_header} but is absent from request`
+						);
+					}
+
 					const value = /** @type {string} */ (req.headers[address_header]) || '';
 
 					if (address_header === 'x-forwarded-for') {
@@ -144,15 +135,19 @@ const ssr = async (req, res) => {
 function sequence(handlers) {
 	/** @type {import('polka').Middleware} */
 	return (req, res, next) => {
-		/** @param {number} i */
+		/**
+		 * @param {number} i
+		 * @returns {ReturnType<import('polka').Middleware>}
+		 */
 		function handle(i) {
-			handlers[i](req, res, () => {
-				if (i < handlers.length) handle(i + 1);
-				else next();
-			});
+			if (i < handlers.length) {
+				return handlers[i](req, res, () => handle(i + 1));
+			} else {
+				return next();
+			}
 		}
 
-		handle(0);
+		return handle(0);
 	};
 }
 

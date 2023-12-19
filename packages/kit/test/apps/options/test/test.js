@@ -1,3 +1,4 @@
+import * as http from 'node:http';
 import { expect } from '@playwright/test';
 import { test } from '../../../utils.js';
 
@@ -58,20 +59,15 @@ test.describe('base path', () => {
 		}
 	});
 
-	test('loads CSS', async ({ page }) => {
+	test('loads CSS', async ({ page, get_computed_style }) => {
 		await page.goto('/path-base/base/');
-		expect(
-			await page.evaluate(() => {
-				const el = document.querySelector('p');
-				return el && getComputedStyle(el).color;
-			})
-		).toBe('rgb(255, 0, 0)');
+		expect(await get_computed_style('p', 'color')).toBe('rgb(255, 0, 0)');
 	});
 
 	test('inlines CSS', async ({ page, javaScriptEnabled }) => {
 		await page.goto('/path-base/base/');
 		if (process.env.DEV) {
-			const ssr_style = await page.evaluate(() => document.querySelector('style[data-sveltekit]'));
+			const ssr_style = await page.$('style[data-sveltekit]');
 
 			if (javaScriptEnabled) {
 				// <style data-sveltekit> is removed upon hydration
@@ -80,17 +76,11 @@ test.describe('base path', () => {
 				expect(ssr_style).not.toBeNull();
 			}
 
-			expect(
-				await page.evaluate(() => document.querySelector('link[rel="stylesheet"]'))
-			).toBeNull();
+			expect(await page.$('link[rel="stylesheet"]')).toBeNull();
 		} else {
-			expect(await page.evaluate(() => document.querySelector('style'))).not.toBeNull();
-			expect(
-				await page.evaluate(() => document.querySelector('link[rel="stylesheet"][disabled]'))
-			).not.toBeNull();
-			expect(
-				await page.evaluate(() => document.querySelector('link[rel="stylesheet"]:not([disabled])'))
-			).not.toBeNull();
+			expect(await page.$('style')).not.toBeNull();
+			expect(await page.$('link[rel="stylesheet"][disabled]')).not.toBeNull();
+			expect(await page.$('link[rel="stylesheet"]:not([disabled])')).not.toBeNull();
 		}
 	});
 
@@ -101,6 +91,13 @@ test.describe('base path', () => {
 
 		await clicknav('[href="/path-base/base/two"]');
 		expect(await page.textContent('h2')).toBe('two');
+	});
+
+	test('resolveRoute accounts for base path', async ({ baseURL, page, clicknav }) => {
+		await page.goto('/path-base/resolve-route');
+		await clicknav('[data-id=target]');
+		expect(page.url()).toBe(`${baseURL}/path-base/resolve-route/resolved/`);
+		expect(await page.textContent('h2')).toBe('resolved');
 	});
 });
 
@@ -133,7 +130,7 @@ test.describe('CSP', () => {
 	});
 
 	test("quotes 'script'", async ({ page }) => {
-		const response = await page.goto(`/path-base`);
+		const response = await page.goto('/path-base');
 		expect(response.headers()['content-security-policy']).toMatch(
 			/require-trusted-types-for 'script'/
 		);
@@ -167,20 +164,35 @@ test.describe('Custom extensions', () => {
 test.describe('env', () => {
 	test('resolves downwards', async ({ page }) => {
 		await page.goto('/path-base/env');
-		expect(await page.textContent('p')).toBe('and thank you');
+		expect(await page.textContent('#public')).toBe('and thank you');
+	});
+	test('respects private prefix', async ({ page }) => {
+		await page.goto('/path-base/env');
+		expect(await page.textContent('#private')).toBe('shhhh');
+		expect(await page.textContent('#neither')).toBe('');
 	});
 });
 
 test.describe('trailingSlash', () => {
 	test('adds trailing slash', async ({ baseURL, page, clicknav }) => {
+		// we can't use Playwright's `request` here, because it resolves redirects
+		const status = await new Promise((fulfil, reject) => {
+			const request = http.get(`${baseURL}/path-base/slash`);
+			request.on('error', reject);
+			request.on('response', (response) => {
+				fulfil(response.statusCode);
+			});
+		});
+		expect(status).toBe(308);
+
 		await page.goto('/path-base/slash');
 
 		expect(page.url()).toBe(`${baseURL}/path-base/slash/`);
-		expect(await page.textContent('h2')).toBe('/slash/');
+		expect(await page.textContent('h2')).toBe('/path-base/slash/');
 
-		await clicknav('[href="/path-base/slash/child"]');
+		await clicknav('[data-testid="child"]');
 		expect(page.url()).toBe(`${baseURL}/path-base/slash/child/`);
-		expect(await page.textContent('h2')).toBe('/slash/child/');
+		expect(await page.textContent('h2')).toBe('/path-base/slash/child/');
 	});
 
 	test('removes trailing slash on endpoint', async ({ baseURL, request }) => {
@@ -227,7 +239,7 @@ test.describe('trailingSlash', () => {
 
 		// also wait for network processing to complete, see
 		// https://playwright.dev/docs/network#network-events
-		await app.preloadData('/path-base/preloading/preloaded');
+		await app.preloadCode('/path-base/preloading/preloaded');
 
 		// svelte request made is environment dependent
 		if (process.env.DEV) {
@@ -236,7 +248,10 @@ test.describe('trailingSlash', () => {
 			expect(requests.filter((req) => req.endsWith('.mjs')).length).toBeGreaterThan(0);
 		}
 
-		expect(requests.includes(`/path-base/preloading/preloaded/__data.json`)).toBe(true);
+		requests = [];
+		await app.preloadData('/path-base/preloading/preloaded');
+
+		expect(requests.includes('/path-base/preloading/preloaded/__data.json')).toBe(true);
 
 		requests = [];
 		await app.goto('/path-base/preloading/preloaded');

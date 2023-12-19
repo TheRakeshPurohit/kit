@@ -1,9 +1,9 @@
-import fs from 'fs';
+import fs from 'node:fs';
 import colors from 'kleur';
-import path from 'path';
+import path from 'node:path';
 import prompts from 'prompts';
 import glob from 'tiny-glob/sync.js';
-import { pathToFileURL } from 'url';
+import { pathToFileURL } from 'node:url';
 import { migrate_scripts } from './migrate_scripts/index.js';
 import { migrate_page } from './migrate_page_js/index.js';
 import { migrate_page_server } from './migrate_page_server/index.js';
@@ -192,7 +192,7 @@ export async function migrate() {
 
 	const tasks = [
 		use_git && cyan('git commit -m "svelte-migrate: renamed files"'),
-		`Review the migration guide at https://github.com/sveltejs/kit/discussions/5774`,
+		'Review the migration guide at https://github.com/sveltejs/kit/discussions/5774',
 		`Search codebase for ${cyan('"@migration"')} and manually complete migration tasks`,
 		use_git && cyan('git add -A'),
 		use_git && cyan('git commit -m "svelte-migrate: updated files"')

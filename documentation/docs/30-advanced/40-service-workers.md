@@ -4,7 +4,7 @@ title: Service workers
 
 Service workers act as proxy servers that handle network requests inside your app. This makes it possible to make your app work offline, but even if you don't need offline support (or can't realistically implement it because of the type of app you're building), it's often worth using service workers to speed up navigation by precaching your built JS and CSS.
 
-In SvelteKit, if you have a `src/service-worker.js` file (or `src/service-worker.ts`, `src/service-worker/index.js`, etc) it will be bundled and automatically registered. You can change the [location of your service worker](configuration#files) if you need to.
+In SvelteKit, if you have a `src/service-worker.js` file (or `src/service-worker/index.js`) it will be bundled and automatically registered. You can change the [location of your service worker](configuration#files) if you need to.
 
 You can [disable automatic registration](configuration#serviceworker) if you need to register the service worker with your own logic or use another solution. The default registration looks something like this:
 
@@ -18,7 +18,7 @@ if ('serviceWorker' in navigator) {
 
 ## Inside the service worker
 
-Inside the service worker you have access to the [`$service-worker` module](modules#$service-worker), which provides you with the paths to all static assets, build files and prerendered pages. You're also provided with an app version string which you can use for creating a unique cache name. If your Vite config specifies `define` (used for global variable replacements), this will be applied to service workers as well as your server/client builds.
+Inside the service worker you have access to the [`$service-worker` module](modules#$service-worker), which provides you with the paths to all static assets, build files and prerendered pages. You're also provided with an app version string, which you can use for creating a unique cache name, and the deployment's `base` path. If your Vite config specifies `define` (used for global variable replacements), this will be applied to service workers as well as your server/client builds.
 
 The following example caches the built app and any files in `static` eagerly, and caches all other requests as they happen. This would make each page work offline once visited.
 
@@ -66,7 +66,11 @@ self.addEventListener('fetch', (event) => {
 
 		// `build`/`files` can always be served from the cache
 		if (ASSETS.includes(url.pathname)) {
-			return cache.match(event.request);
+			const response = await cache.match(url.pathname);
+
+			if (response) {
+				return response;
+			}
 		}
 
 		// for everything else, try the network first, but
@@ -74,13 +78,27 @@ self.addEventListener('fetch', (event) => {
 		try {
 			const response = await fetch(event.request);
 
+			// if we're offline, fetch can return a value that is not a Response
+			// instead of throwing - and we can't pass this non-Response to respondWith
+			if (!(response instanceof Response)) {
+				throw new Error('invalid response from fetch');
+			}
+
 			if (response.status === 200) {
 				cache.put(event.request, response.clone());
 			}
 
 			return response;
-		} catch {
-			return cache.match(event.request);
+		} catch (err) {
+			const response = await cache.match(event.request);
+
+			if (response) {
+				return response;
+			}
+
+			// if there's no cache, then just error out
+			// as there is nothing we can do to respond to this request
+			throw err;
 		}
 	}
 

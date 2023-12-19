@@ -7,9 +7,9 @@ import json from '@rollup/plugin-json';
 
 const files = fileURLToPath(new URL('./files', import.meta.url).href);
 
-/** @type {import('.').default} */
+/** @type {import('./index.js').default} */
 export default function (opts = {}) {
-	const { out = 'build', precompress, envPrefix = '', polyfill = true } = opts;
+	const { out = 'build', precompress, envPrefix = '' } = opts;
 
 	return {
 		name: '@sveltejs/adapter-node',
@@ -57,14 +57,23 @@ export default function (opts = {}) {
 					// dependencies could have deep exports, so we need a regex
 					...Object.keys(pkg.dependencies || {}).map((d) => new RegExp(`^${d}(\\/.*)?$`))
 				],
-				plugins: [nodeResolve({ preferBuiltins: true }), commonjs({ strictRequires: true }), json()]
+				plugins: [
+					nodeResolve({
+						preferBuiltins: true,
+						exportConditions: ['node']
+					}),
+					// @ts-ignore https://github.com/rollup/plugins/issues/1329
+					commonjs({ strictRequires: true }),
+					// @ts-ignore https://github.com/rollup/plugins/issues/1329
+					json()
+				]
 			});
 
 			await bundle.write({
 				dir: `${out}/server`,
 				format: 'esm',
 				sourcemap: true,
-				chunkFileNames: `chunks/[name]-[hash].js`
+				chunkFileNames: 'chunks/[name]-[hash].js'
 			});
 
 			builder.copy(files, out, {
@@ -77,11 +86,6 @@ export default function (opts = {}) {
 					ENV_PREFIX: JSON.stringify(envPrefix)
 				}
 			});
-
-			// If polyfills aren't wanted then clear the file
-			if (!polyfill) {
-				writeFileSync(`${out}/shims.js`, '', 'utf-8');
-			}
 		}
 	};
 }

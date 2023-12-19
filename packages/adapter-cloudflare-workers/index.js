@@ -1,9 +1,9 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs';
-import { posix, dirname } from 'path';
-import { execSync } from 'child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { posix, dirname } from 'node:path';
+import { execSync } from 'node:child_process';
 import esbuild from 'esbuild';
 import toml from '@iarna/toml';
-import { fileURLToPath } from 'url';
+import { fileURLToPath } from 'node:url';
 
 /**
  * @typedef {{
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
  * }} WranglerConfig
  */
 
-/** @type {import('.').default} */
+/** @type {import('./index.js').default} */
 export default function ({ config = 'wrangler.toml' } = {}) {
 	return {
 		name: '@sveltejs/adapter-cloudflare-workers',
@@ -45,25 +45,35 @@ export default function ({ config = 'wrangler.toml' } = {}) {
 				}
 			});
 
+			let prerendered_entries = Array.from(builder.prerendered.pages.entries());
+
+			if (builder.config.kit.paths.base) {
+				prerendered_entries = prerendered_entries.map(([path, { file }]) => [
+					path,
+					{ file: `${builder.config.kit.paths.base}/${file}` }
+				]);
+			}
+
 			writeFileSync(
 				`${tmp}/manifest.js`,
 				`export const manifest = ${builder.generateManifest({
 					relativePath
-				})};\n\nexport const prerendered = new Map(${JSON.stringify(
-					Array.from(builder.prerendered.pages.entries())
-				)});\n`
+				})};\n\nexport const prerendered = new Map(${JSON.stringify(prerendered_entries)});\n`
 			);
 
 			await esbuild.build({
 				platform: 'browser',
 				conditions: ['worker', 'browser'],
 				sourcemap: 'linked',
-				target: 'es2020',
+				target: 'es2022',
 				entryPoints: [`${tmp}/entry.js`],
 				outfile: main,
 				bundle: true,
-				external: ['__STATIC_CONTENT_MANIFEST'],
-				format: 'esm'
+				external: ['__STATIC_CONTENT_MANIFEST', 'cloudflare:*'],
+				format: 'esm',
+				loader: {
+					'.wasm': 'copy'
+				}
 			});
 
 			builder.log.minor('Copying assets...');

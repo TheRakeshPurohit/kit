@@ -3,16 +3,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nodeFileTrace } from '@vercel/nft';
 import esbuild from 'esbuild';
+import { get_pathname } from './utils.js';
 
-const VALID_RUNTIMES = ['edge', 'nodejs16.x', 'nodejs18.x'];
+const DEFAULT_FUNCTION_NAME = 'fn';
 
 const get_default_runtime = () => {
 	const major = process.version.slice(1).split('.')[0];
-	if (major === '16') return 'nodejs16.x';
 	if (major === '18') return 'nodejs18.x';
+	if (major === '20') return 'nodejs20.x';
 
 	throw new Error(
-		`Unsupported Node.js version: ${process.version}. Please use Node 16 or Node 18 to build your project, or explicitly specify a runtime in your adapter configuration.`
+		`Unsupported Node.js version: ${process.version}. Please use Node 18 or Node 20 to build your project, or explicitly specify a runtime in your adapter configuration.`
 	);
 };
 
@@ -39,6 +40,12 @@ const plugin = function (defaults = {}) {
 			builder.rimraf(dir);
 			builder.rimraf(tmp);
 
+			if (fs.existsSync('vercel.json')) {
+				const vercel_file = fs.readFileSync('vercel.json', 'utf-8');
+				const vercel_config = JSON.parse(vercel_file);
+				validate_vercel_json(builder, vercel_config);
+			}
+
 			const files = fileURLToPath(new URL('./files', import.meta.url).href);
 
 			const dirs = {
@@ -46,7 +53,7 @@ const plugin = function (defaults = {}) {
 				functions: `${dir}/functions`
 			};
 
-			const static_config = static_vercel_config(builder);
+			const static_config = static_vercel_config(builder, defaults);
 
 			builder.log.minor('Generating serverless function...');
 
@@ -87,13 +94,6 @@ const plugin = function (defaults = {}) {
 				const tmp = builder.getBuildDirectory(`vercel-tmp/${name}`);
 				const relativePath = path.posix.relative(tmp, builder.getServerDirectory());
 
-				const envVarsInUse = new Set();
-				routes.forEach((route) => {
-					route.config?.envVarsInUse?.forEach((x) => {
-						envVarsInUse.add(x);
-					});
-				});
-
 				builder.copy(`${files}/edge.js`, `${tmp}/edge.js`, {
 					replace: {
 						SERVER: `${relativePath}/index.js`,
@@ -115,7 +115,10 @@ const plugin = function (defaults = {}) {
 					format: 'esm',
 					external: config.external,
 					sourcemap: 'linked',
-					banner: { js: 'globalThis.global = globalThis;' }
+					banner: { js: 'globalThis.global = globalThis;' },
+					loader: {
+						'.wasm': 'copy'
+					}
 				});
 
 				write(
@@ -124,7 +127,6 @@ const plugin = function (defaults = {}) {
 						{
 							runtime: config.runtime,
 							regions: config.regions,
-							envVarsInUse: [...envVarsInUse],
 							entrypoint: 'index.js'
 						},
 						null,
@@ -145,26 +147,42 @@ const plugin = function (defaults = {}) {
 			/** @type {Map<import('@sveltejs/kit').RouteDefinition<import('.').Config>, { expiration: number | false, bypassToken: string | undefined, allowQuery: string[], group: number, passQuery: true }>} */
 			const isr_config = new Map();
 
+			/** @type {Set<string>} */
+			const ignored_isr = new Set();
+
 			// group routes by config
 			for (const route of builder.routes) {
-				if (route.prerender === true) continue;
-
-				const pattern = route.pattern.toString();
-
 				const runtime = route.config?.runtime ?? defaults?.runtime ?? get_default_runtime();
-				if (runtime && !VALID_RUNTIMES.includes(runtime)) {
+				const config = { runtime, ...defaults, ...route.config };
+
+				if (is_prerendered(route)) {
+					if (config.isr) {
+						ignored_isr.add(route.id);
+					}
+					continue;
+				}
+
+				const node_runtime = /nodejs([0-9]+)\.x/.exec(runtime);
+				if (runtime !== 'edge' && (!node_runtime || node_runtime[1] < 18)) {
 					throw new Error(
-						`Invalid runtime '${runtime}' for route ${
-							route.id
-						}. Valid runtimes are ${VALID_RUNTIMES.join(', ')}`
+						`Invalid runtime '${runtime}' for route ${route.id}. Valid runtimes are 'edge' and 'nodejs18.x' or higher ` +
+							'(see the Node.js Version section in your Vercel project settings for info on the currently supported versions).'
 					);
 				}
 
-				const config = { runtime, ...defaults, ...route.config };
-
 				if (config.isr) {
+					const directory = path.relative('.', builder.config.kit.files.routes + route.id);
+
+					if (!runtime.startsWith('nodejs')) {
+						throw new Error(
+							`${directory}: Routes using \`isr\` must use a Node.js runtime (for example 'nodejs20.x')`
+						);
+					}
+
 					if (config.isr.allowQuery?.includes('__pathname')) {
-						throw new Error('__pathname is a reserved query parameter for isr.allowQuery');
+						throw new Error(
+							`${directory}: \`__pathname\` is a reserved query parameter for \`isr.allowQuery\``
+						);
 					}
 
 					isr_config.set(route, {
@@ -179,6 +197,7 @@ const plugin = function (defaults = {}) {
 				const hash = hash_config(config);
 
 				// first, check there are no routes with incompatible configs that will be merged
+				const pattern = route.pattern.toString();
 				const existing = conflicts.get(pattern);
 				if (existing) {
 					if (existing.hash !== hash) {
@@ -201,6 +220,20 @@ const plugin = function (defaults = {}) {
 				group.routes.push(route);
 			}
 
+			if (ignored_isr.size) {
+				builder.log.warn(
+					'\nWarning: The following routes have an ISR config which is ignored because the route is prerendered:'
+				);
+
+				for (const ignored of ignored_isr) {
+					console.log(`    - ${ignored}`);
+				}
+
+				console.log(
+					'Either remove the "prerender" option from these routes to use ISR, or remove the ISR config.\n'
+				);
+			}
+
 			const singular = groups.size === 1;
 
 			for (const group of groups.values()) {
@@ -208,7 +241,7 @@ const plugin = function (defaults = {}) {
 					group.config.runtime === 'edge' ? generate_edge_function : generate_serverless_function;
 
 				// generate one function for the group
-				const name = singular ? 'fn' : `fn-${group.i}`;
+				const name = singular ? DEFAULT_FUNCTION_NAME : `fn-${group.i}`;
 
 				await generate_function(
 					name,
@@ -222,7 +255,7 @@ const plugin = function (defaults = {}) {
 			}
 
 			for (const route of builder.routes) {
-				if (route.prerender === true) continue;
+				if (is_prerendered(route)) continue;
 
 				const pattern = route.pattern.toString();
 
@@ -253,13 +286,7 @@ const plugin = function (defaults = {}) {
 					fs.symlinkSync(relative, `${base}.func`);
 					fs.symlinkSync(`../${relative}`, `${base}/__data.json.func`);
 
-					let i = 1;
-					const pathname = route.segments
-						.map((segment) => {
-							return segment.dynamic ? `$${i++}` : segment.content;
-						})
-						.join('/');
-
+					const pathname = get_pathname(route);
 					const json = JSON.stringify(isr, null, '\t');
 
 					write(`${base}.prerender-config.json`, json);
@@ -281,11 +308,24 @@ const plugin = function (defaults = {}) {
 				}
 			}
 
-			if (singular) {
-				// Common case: One function for all routes
-				// Needs to happen after ISR or else regex swallows all other matches
-				static_config.routes.push({ src: '/.*', dest: `/fn` });
+			if (!singular) {
+				// we need to create a catch-all route so that 404s are handled
+				// by SvelteKit rather than Vercel
+
+				const runtime = defaults.runtime ?? get_default_runtime();
+				const generate_function =
+					runtime === 'edge' ? generate_edge_function : generate_serverless_function;
+
+				await generate_function(
+					DEFAULT_FUNCTION_NAME,
+					/** @type {any} */ ({ runtime, ...defaults }),
+					[]
+				);
 			}
+
+			// Catch-all route must come at the end, otherwise it will swallow all other routes,
+			// including ISR aliases if there is only one function
+			static_config.routes.push({ src: '/.*', dest: `/${DEFAULT_FUNCTION_NAME}` });
 
 			builder.log.minor('Copying assets...');
 
@@ -306,7 +346,8 @@ function hash_config(config) {
 		config.external ?? '',
 		config.regions ?? '',
 		config.memory ?? '',
-		config.maxDuration ?? ''
+		config.maxDuration ?? '',
+		!!config.isr // need to distinguish ISR from non-ISR functions, because ISR functions can't use streaming mode
 	].join('/');
 }
 
@@ -325,13 +366,19 @@ function write(file, data) {
 }
 
 // This function is duplicated in adapter-static
-/** @param {import('@sveltejs/kit').Builder} builder */
-function static_vercel_config(builder) {
+/**
+ * @param {import('@sveltejs/kit').Builder} builder
+ * @param {import('.').Config} config
+ */
+function static_vercel_config(builder, config) {
 	/** @type {any[]} */
 	const prerendered_redirects = [];
 
 	/** @type {Record<string, { path: string }>} */
 	const overrides = {};
+
+	/** @type {import('./index').ImagesConfig} */
+	const images = config.images;
 
 	for (const [src, redirect] of builder.prerendered.redirects) {
 		prerendered_redirects.push({
@@ -378,7 +425,8 @@ function static_vercel_config(builder) {
 				handle: 'filesystem'
 			}
 		],
-		overrides
+		overrides,
+		images
 	};
 }
 
@@ -425,7 +473,7 @@ async function create_function_bundle(builder, entry, dir, config) {
 	if (resolution_failures.size > 0) {
 		const cwd = process.cwd();
 		builder.log.warn(
-			'The following modules failed to locate dependencies that may (or may not) be required for your app to work:'
+			'Warning: The following modules failed to locate dependencies that may (or may not) be required for your app to work:'
 		);
 
 		for (const [importer, modules] of resolution_failures) {
@@ -489,7 +537,7 @@ async function create_function_bundle(builder, entry, dir, config) {
 				maxDuration: config.maxDuration,
 				handler: path.relative(base + ancestor, entry),
 				launcherType: 'Nodejs',
-				experimentalResponseStreaming: true
+				experimentalResponseStreaming: !config.isr
 			},
 			null,
 			'\t'
@@ -497,6 +545,65 @@ async function create_function_bundle(builder, entry, dir, config) {
 	);
 
 	write(`${dir}/package.json`, JSON.stringify({ type: 'module' }));
+}
+
+/**
+ *
+ * @param {import('@sveltejs/kit').Builder} builder
+ * @param {any} vercel_config
+ */
+function validate_vercel_json(builder, vercel_config) {
+	if (builder.routes.length > 0 && !builder.routes[0].api) {
+		// bail — we're on an older SvelteKit version that doesn't
+		// populate `route.api.methods`, so we can't check
+		// to see if cron paths are valid
+		return;
+	}
+
+	const crons = /** @type {Array<unknown>} */ (
+		Array.isArray(vercel_config?.crons) ? vercel_config.crons : []
+	);
+
+	/** For a route to be considered 'valid', it must be an API route with a GET handler */
+	const valid_routes = builder.routes.filter((route) => route.api.methods.includes('GET'));
+
+	/** @type {Array<string>} */
+	const unmatched_paths = [];
+
+	for (const cron of crons) {
+		if (typeof cron !== 'object' || cron === null || !('path' in cron)) {
+			continue;
+		}
+
+		const { path } = cron;
+		if (typeof path !== 'string') {
+			continue;
+		}
+
+		if (!valid_routes.some((route) => route.pattern.test(path))) {
+			unmatched_paths.push(path);
+		}
+	}
+
+	if (unmatched_paths.length) {
+		builder.log.warn(
+			'\nWarning: vercel.json defines cron tasks that use paths that do not correspond to an API route with a GET handler (ignore this if the request is handled in your `handle` hook):'
+		);
+
+		for (const path of unmatched_paths) {
+			console.log(`    - ${path}`);
+		}
+
+		console.log('');
+	}
+}
+
+/** @param {import('@sveltejs/kit').RouteDefinition} route */
+function is_prerendered(route) {
+	return (
+		route.prerender === true ||
+		(route.prerender === 'auto' && route.segments.every((segment) => !segment.dynamic))
+	);
 }
 
 export default plugin;

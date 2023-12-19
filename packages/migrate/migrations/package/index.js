@@ -1,8 +1,8 @@
-import fs from 'fs';
+import fs from 'node:fs';
 import colors from 'kleur';
-import path from 'path';
+import path from 'node:path';
 import prompts from 'prompts';
-import { pathToFileURL } from 'url';
+import { pathToFileURL } from 'node:url';
 import { bail, check_git } from '../../utils.js';
 import { migrate_config } from './migrate_config.js';
 import { migrate_pkg } from './migrate_pkg.js';
@@ -64,8 +64,8 @@ export async function migrate() {
 
 	const tasks = [
 		use_git && cyan('git commit -m "migration to @sveltejs/package v2"'),
-		`Review the migration guide at https://github.com/sveltejs/kit/pull/8922`,
-		`Read the updated docs at https://kit.svelte.dev/docs/packaging`
+		'Review the migration guide at https://github.com/sveltejs/kit/pull/8922',
+		'Read the updated docs at https://kit.svelte.dev/docs/packaging'
 	].filter(Boolean);
 
 	tasks.forEach((task, i) => {
